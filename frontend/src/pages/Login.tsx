@@ -9,12 +9,12 @@ interface AuthResponse {
   message?: string
   error?: string
   token?: string
-  user?: { id: number; name: string; email: string }
+  user?: { id: number; name: string; phone: string; is_admin?: number; isAdmin?: number | boolean }
 }
 
 export default function Login() {
   const navigate = useNavigate()
-  const [email, setEmail] = useState('')
+  const [phone, setPhone] = useState('')
   const [password, setPassword] = useState('')
   const [remember, setRemember] = useState(false)
   const [message, setMessage] = useState('')
@@ -31,7 +31,7 @@ export default function Login() {
       const response = await fetch(`${API_URL}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password, remember }),
+        body: JSON.stringify({ phone, password, remember }),
       })
 
       const data = (await response.json()) as AuthResponse
@@ -64,7 +64,7 @@ export default function Login() {
           <img src={heroImage} alt="Imagem decorativa" />
           <div className="hero-overlay">
             <h2>Bem-vindo de volta</h2>
-            <p>Entre para continuar sua jornada com segurança e estilo.</p>
+            <p>“Entre para continuar sua jornada com segurança e estilo”</p>
           </div>
         </aside>
 
@@ -73,14 +73,14 @@ export default function Login() {
           <p className="subtitle">Use sua conta para acessar o painel.</p>
 
           <form className="auth-form" onSubmit={onSubmit}>
-            <label htmlFor="email">E-mail</label>
+            <label htmlFor="phone">Telefone</label>
             <input
-              id="email"
-              type="email"
-              placeholder="voce@empresa.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              autoComplete="email"
+              id="phone"
+              type="tel"
+              placeholder="(11) 99999-9999"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              autoComplete="tel"
               required
             />
 

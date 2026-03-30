@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { FormEvent } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import heroImage from '../assets/hero.png'
 
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3333'
@@ -9,15 +9,18 @@ interface AuthResponse {
   message?: string
   error?: string
   token?: string
-  user?: { id: number; name: string; email: string }
+  user?: { id: number; name: string; phone: string }
 }
 
 export default function Register() {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const initialRef = (searchParams.get('ref') ?? '').trim().toUpperCase()
   const [name, setName] = useState('')
-  const [email, setEmail] = useState('')
+  const [phone, setPhone] = useState('')
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
+  const [referralCode, setReferralCode] = useState(initialRef)
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
@@ -43,7 +46,12 @@ export default function Register() {
       const response = await fetch(`${API_URL}/api/auth/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, email, password }),
+        body: JSON.stringify({
+          name,
+          phone,
+          password,
+          referralCode: referralCode.trim() || undefined,
+        }),
       })
 
       const data = (await response.json()) as AuthResponse
@@ -95,14 +103,14 @@ export default function Register() {
               required
             />
 
-            <label htmlFor="email">E-mail</label>
+            <label htmlFor="phone">Telefone</label>
             <input
-              id="email"
-              type="email"
-              placeholder="voce@empresa.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              autoComplete="email"
+              id="phone"
+              type="tel"
+              placeholder="(11) 99999-9999"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              autoComplete="tel"
               required
             />
 
@@ -126,6 +134,16 @@ export default function Register() {
               onChange={(e) => setConfirm(e.target.value)}
               autoComplete="new-password"
               required
+            />
+
+            <label htmlFor="referralCode">Código de convite (opcional)</label>
+            <input
+              id="referralCode"
+              type="text"
+              placeholder="Ex.: 342A6L31M"
+              value={referralCode}
+              onChange={(e) => setReferralCode(e.target.value.toUpperCase())}
+              autoComplete="off"
             />
 
             <button type="submit" disabled={loading}>
