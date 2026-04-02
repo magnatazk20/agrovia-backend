@@ -3538,12 +3538,23 @@ app.get('/api/site-settings', async (_req, res) => {
       `
     )
 
+    try {
+      await pool.query(
+        `
+        ALTER TABLE site_settings
+        ADD COLUMN site_logo_url VARCHAR(500) NULL
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
         site_title AS siteTitle,
         site_description AS siteDescription,
-        site_logo_url AS siteLogoUrl,
+        COALESCE(site_logo_url, '') AS siteLogoUrl,
         updated_at AS updatedAt
       FROM site_settings
       ORDER BY id ASC
@@ -3595,13 +3606,24 @@ app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
       `
     )
 
+    try {
+      await pool.query(
+        `
+        ALTER TABLE site_settings
+        ADD COLUMN site_logo_url VARCHAR(500) NULL
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
         id,
         site_title AS siteTitle,
         site_description AS siteDescription,
-        site_logo_url AS siteLogoUrl,
+        COALESCE(site_logo_url, '') AS siteLogoUrl,
         updated_at AS updatedAt
       FROM site_settings
       ORDER BY id ASC
