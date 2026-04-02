@@ -68,7 +68,7 @@ export default function AdminSidebar() {
 
           <p className="dash-nav-group-title">Sistema</p>
           <button type="button" className="dash-nav-item" onClick={() => { navigate('/adf/site-settings'); setMenuOpen(false) }}>Editar Site</button>
-          <button type="button" className="dash-nav-item" onClick={() => { navigate('/profile'); setMenuOpen(false) }}>Perfil</button>
+          <button type="button" className="dash-nav-item" onClick={() => { navigate('/adf/logs'); setMenuOpen(false) }}>Perfil</button>
         </nav>
 
         <button

@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { useEffect } from 'react'
 import Login from './pages/Login'
 import Register from './pages/Register'
 import Dashboard from './pages/Dashboard'
@@ -28,6 +29,7 @@ import AdminUserHistory from './pages/AdminUserHistory'
 import AdminWithdrawConfig from './pages/AdminWithdrawConfig'
 import AdminRankings from './pages/AdminRankings'
 import AdminSiteSettings from './pages/AdminSiteSettings'
+import AdminLogs from './pages/AdminLogs'
 import RequireAuth from './components/RequireAuth'
 import RequireMaxAdmin from './components/RequireMaxAdmin'
 import './App.css'
@@ -50,10 +52,74 @@ function AnimatedBackground() {
   )
 }
 
+function SiteMetaSync() {
+  useEffect(() => {
+    const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3333'
+
+    const applyMeta = (title: string, description: string, logoUrl?: string) => {
+      const normalizedTitle = title.trim() || 'frontend'
+      const normalizedDescription = description.trim() || 'frontend'
+      const normalizedLogoUrl = String(logoUrl ?? '').trim()
+
+      document.title = normalizedTitle
+
+      let descriptionTag = document.querySelector('meta[name="description"]') as HTMLMetaElement | null
+      if (!descriptionTag) {
+        descriptionTag = document.createElement('meta')
+        descriptionTag.setAttribute('name', 'description')
+        document.head.appendChild(descriptionTag)
+      }
+      descriptionTag.setAttribute('content', normalizedDescription)
+
+      if (normalizedLogoUrl) {
+        let faviconTag = document.querySelector('link[rel="icon"]') as HTMLLinkElement | null
+        if (!faviconTag) {
+          faviconTag = document.createElement('link')
+          faviconTag.setAttribute('rel', 'icon')
+          document.head.appendChild(faviconTag)
+        }
+        faviconTag.setAttribute('href', normalizedLogoUrl)
+      }
+    }
+
+    const loadSiteSettings = async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/site-settings`)
+        const data = (await res.json()) as {
+          ok?: boolean
+          settings?: {
+            siteTitle?: string
+            siteDescription?: string
+            siteLogoUrl?: string
+          }
+        }
+
+        if (!res.ok || !data?.ok) {
+          applyMeta('frontend', 'frontend')
+          return
+        }
+
+        applyMeta(
+          String(data.settings?.siteTitle ?? ''),
+          String(data.settings?.siteDescription ?? ''),
+          String(data.settings?.siteLogoUrl ?? '')
+        )
+      } catch {
+        applyMeta('frontend', 'frontend')
+      }
+    }
+
+    loadSiteSettings()
+  }, [])
+
+  return null
+}
+
 export default function App() {
   return (
     <BrowserRouter>
       <AnimatedBackground />
+      <SiteMetaSync />
       <Routes>
         <Route path="/" element={<Login />} />
         <Route path="/cadastro" element={<Register />} />
@@ -136,6 +202,14 @@ export default function App() {
           element={(
             <RequireMaxAdmin>
               <AdminSiteSettings />
+            </RequireMaxAdmin>
+          )}
+        />
+        <Route
+          path="/adf/logs"
+          element={(
+            <RequireMaxAdmin>
+              <AdminLogs />
             </RequireMaxAdmin>
           )}
         />

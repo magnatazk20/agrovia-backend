@@ -4487,6 +4487,123 @@ app.post('/api/admin/users/:id/balance', requireMaxAdmin, async (req: Authentica
   }
 })
 
+app.get('/api/admin/logs', requireMaxAdmin, async (req, res) => {
+  const category = String(req.query.category ?? 'all').trim().toLowerCase()
+  const rawLimit = Number(req.query.limit ?? 300)
+  const limit = Math.min(Math.max(rawLimit, 1), 1000)
+
+  try {
+    await pool.query(
+      `
+      CREATE TABLE IF NOT EXISTS logs (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NULL,
+        entity_type VARCHAR(60) NOT NULL,
+        entity_id BIGINT UNSIGNED NULL,
+        action VARCHAR(100) NOT NULL,
+        old_balance DECIMAL(12,2) NULL,
+        new_balance DECIMAL(12,2) NULL,
+        amount DECIMAL(12,2) NULL,
+        metadata JSON NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_logs_user_id (user_id),
+        KEY idx_logs_entity_type (entity_type),
+        KEY idx_logs_entity_id (entity_id),
+        KEY idx_logs_action (action),
+        KEY idx_logs_created_at (created_at)
+      )
+      `
+    )
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        l.id,
+        l.user_id AS userId,
+        l.entity_type AS entityType,
+        l.entity_id AS entityId,
+        l.action,
+        l.old_balance AS oldBalance,
+        l.new_balance AS newBalance,
+        l.amount,
+        l.metadata,
+        l.created_at AS createdAt,
+        u.name AS userName,
+        u.phone AS userPhone
+      FROM logs l
+      LEFT JOIN users u ON u.id = l.user_id
+      ORDER BY l.id DESC
+      LIMIT ?
+      `,
+      [limit]
+    )
+
+    type LogCategory = 'withdraw' | 'deposit' | 'balance' | 'security' | 'gift_code' | 'checkin' | 'vip' | 'cycle' | 'other'
+
+    const resolveCategory = (actionRaw: string, entityTypeRaw: string): LogCategory => {
+      const action = String(actionRaw ?? '').toLowerCase()
+      const entityType = String(entityTypeRaw ?? '').toLowerCase()
+
+      if (action.includes('withdraw') || entityType === 'withdrawal') return 'withdraw'
+      if (action.includes('cashin') || action.includes('deposit') || entityType === 'cashin') return 'deposit'
+      if (action.includes('balance') || action.includes('admin_balance')) return 'balance'
+      if (action.includes('password') || action.includes('login') || action.includes('security')) return 'security'
+      if (action.includes('gift') || action.includes('code')) return 'gift_code'
+      if (action.includes('checkin')) return 'checkin'
+      if (action.includes('vip')) return 'vip'
+      if (action.includes('cycle')) return 'cycle'
+      return 'other'
+    }
+
+    const mapped = rows.map((row) => {
+      const parsedCategory = resolveCategory(String(row.action ?? ''), String(row.entityType ?? ''))
+      return {
+        id: Number(row.id),
+        userId: row.userId == null ? null : Number(row.userId),
+        userName: row.userName == null ? null : String(row.userName),
+        userPhone: row.userPhone == null ? null : String(row.userPhone),
+        entityType: String(row.entityType ?? ''),
+        entityId: row.entityId == null ? null : Number(row.entityId),
+        action: String(row.action ?? ''),
+        category: parsedCategory,
+        oldBalance: row.oldBalance == null ? null : Number(row.oldBalance),
+        newBalance: row.newBalance == null ? null : Number(row.newBalance),
+        amount: row.amount == null ? null : Number(row.amount),
+        metadata: row.metadata == null ? null : String(row.metadata),
+        createdAt: row.createdAt ? String(row.createdAt) : null,
+      }
+    })
+
+    const filtered = category === 'all'
+      ? mapped
+      : mapped.filter((item) => item.category === category)
+
+    const grouped = {
+      withdraw: filtered.filter((item) => item.category === 'withdraw'),
+      deposit: filtered.filter((item) => item.category === 'deposit'),
+      balance: filtered.filter((item) => item.category === 'balance'),
+      security: filtered.filter((item) => item.category === 'security'),
+      gift_code: filtered.filter((item) => item.category === 'gift_code'),
+      checkin: filtered.filter((item) => item.category === 'checkin'),
+      vip: filtered.filter((item) => item.category === 'vip'),
+      cycle: filtered.filter((item) => item.category === 'cycle'),
+      other: filtered.filter((item) => item.category === 'other'),
+    }
+
+    res.json({
+      ok: true,
+      filter: { category, limit },
+      total: filtered.length,
+      logs: filtered,
+      grouped,
+    })
+  } catch (err) {
+    console.error('[admin-logs-list]', err)
+    res.status(500).json({ ok: false, error: 'Falha ao carregar logs administrativos.' })
+  }
+})
+
 app.get('/api/admin/users/:id/details', requireMaxAdmin, async (req, res) => {
   const userId = Number(req.params.id)
 
