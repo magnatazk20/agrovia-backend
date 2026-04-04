@@ -4438,6 +4438,31 @@ app.get('/api/admin/withdrawals/latest', requireMaxAdmin, async (req, res) => {
 
 app.get('/api/admin/withdrawals/pending', requireMaxAdmin, async (_req, res) => {
   try {
+    await pool.query(
+      `
+      CREATE TABLE IF NOT EXISTS system_withdraw_config (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        withdraw_fee_percent DECIMAL(8,2) NOT NULL DEFAULT 0.00,
+        min_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        max_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+      )
+      `
+    )
+
+    const [configRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT withdraw_fee_percent AS withdrawFeePercent
+      FROM system_withdraw_config
+      ORDER BY id ASC
+      LIMIT 1
+      `
+    )
+
+    const configuredFeePercent = Number(configRows[0]?.withdrawFeePercent ?? 0)
+
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
@@ -4457,28 +4482,230 @@ app.get('/api/admin/withdrawals/pending', requireMaxAdmin, async (_req, res) => 
       `
     )
 
-    const withdrawals = rows.map((row) => ({
-      id: Number(row.id),
-      amount: Number(row.amount ?? 0),
-      status: String(row.status ?? 'pending').toLowerCase(),
-      createdAt: row.createdAt,
-      updatedAt: row.updatedAt,
-      paidAt: row.paidAt,
-      user: {
-        id: Number(row.userId),
-        name: String(row.userName ?? 'Usuário'),
-        phone: String(row.userPhone ?? ''),
-      },
-    }))
+    const withdrawals = rows.map((row) => {
+      const amount = Number(row.amount ?? 0)
+      const feeAmount = Number(((amount * configuredFeePercent) / 100).toFixed(2))
+      const netAmount = Number((amount - feeAmount).toFixed(2))
+
+      return {
+        id: Number(row.id),
+        amount,
+        status: String(row.status ?? 'pending').toLowerCase(),
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+        paidAt: row.paidAt,
+        feePercent: configuredFeePercent,
+        feeAmount,
+        netAmount,
+        user: {
+          id: Number(row.userId),
+          name: String(row.userName ?? 'Usuário'),
+          phone: String(row.userPhone ?? ''),
+        },
+      }
+    })
 
     res.json({
       ok: true,
       total: withdrawals.length,
+      withdrawFeePercent: configuredFeePercent,
       withdrawals,
     })
   } catch (err) {
     console.error('[admin-withdrawals-pending]', err)
     res.status(500).json({ ok: false, error: 'Erro ao carregar saques pendentes.' })
+  }
+})
+
+app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
+  const withdrawalId = Number(req.params.id)
+  const { action, refundOnCancel, provider } = req.body as {
+    action?: 'approve' | 'cancel'
+    refundOnCancel?: boolean
+    provider?: 'syncpay' | 'connectpay'
+  }
+
+  const parsedAction = String(action ?? '').toLowerCase()
+  const shouldRefund = Boolean(refundOnCancel)
+  const parsedProvider = String(provider ?? '').trim().toLowerCase()
+
+  if (parsedAction === 'approve' && !['syncpay', 'connectpay'].includes(parsedProvider)) {
+    res.status(400).json({ ok: false, error: 'Provedor inválido. Use syncpay ou connectpay.' })
+    return
+  }
+
+  if (!withdrawalId || Number.isNaN(withdrawalId)) {
+    res.status(400).json({ ok: false, error: 'ID do saque inválido.' })
+    return
+  }
+
+  if (!['approve', 'cancel'].includes(parsedAction)) {
+    res.status(400).json({ ok: false, error: 'Ação inválida. Use approve ou cancel.' })
+    return
+  }
+
+  const conn = await pool.getConnection()
+  try {
+    await conn.beginTransaction()
+
+    const [withdrawRows] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT id, user_id AS userId, amount, status
+      FROM withdrawals
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [withdrawalId]
+    )
+
+    if (withdrawRows.length === 0) {
+      await conn.rollback()
+      res.status(404).json({ ok: false, error: 'Saque não encontrado.' })
+      return
+    }
+
+    const withdrawal = withdrawRows[0]
+    const currentStatus = String(withdrawal.status ?? '').toLowerCase()
+
+    if (!['pending', 'processing'].includes(currentStatus)) {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: 'Somente saques pendentes/processando podem ser alterados.' })
+      return
+    }
+
+    const nextStatus = parsedAction === 'approve' ? 'paid' : 'failed'
+    const amount = Number(withdrawal.amount ?? 0)
+    const userId = Number(withdrawal.userId)
+
+    const providerTransactionId =
+      parsedAction === 'approve'
+        ? `${parsedProvider.toUpperCase()}-${Date.now()}-${withdrawalId}`
+        : null
+
+    await conn.query(
+      `
+      UPDATE withdrawals
+      SET
+        status = ?,
+        provider_transaction_id = CASE
+          WHEN ? = 'paid' THEN COALESCE(?, provider_transaction_id)
+          ELSE provider_transaction_id
+        END,
+        provider_payload = CASE
+          WHEN ? = 'paid' THEN JSON_OBJECT(
+            'provider', ?,
+            'processedByAdminId', ?,
+            'processedAt', NOW()
+          )
+          ELSE provider_payload
+        END,
+        paid_at = CASE WHEN ? = 'paid' THEN NOW() ELSE paid_at END,
+        updated_at = NOW()
+      WHERE id = ?
+      `,
+      [
+        nextStatus,
+        nextStatus,
+        providerTransactionId,
+        nextStatus,
+        parsedAction === 'approve' ? parsedProvider : null,
+        Number(req.authUser?.id ?? 0),
+        nextStatus,
+        withdrawalId,
+      ]
+    )
+
+    let refunded = false
+    if (parsedAction === 'cancel' && shouldRefund && amount > 0 && userId > 0) {
+      await conn.query(
+        `
+        UPDATE users
+        SET balance = COALESCE(balance, 0) + ?
+        WHERE id = ?
+        `,
+        [amount, userId]
+      )
+      refunded = true
+    }
+
+    await conn.query(
+      `
+      CREATE TABLE IF NOT EXISTS logs (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NULL,
+        entity_type VARCHAR(60) NOT NULL,
+        entity_id BIGINT UNSIGNED NULL,
+        action VARCHAR(100) NOT NULL,
+        old_balance DECIMAL(12,2) NULL,
+        new_balance DECIMAL(12,2) NULL,
+        amount DECIMAL(12,2) NULL,
+        metadata JSON NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_logs_user_id (user_id),
+        KEY idx_logs_entity_type (entity_type),
+        KEY idx_logs_entity_id (entity_id),
+        KEY idx_logs_action (action),
+        KEY idx_logs_created_at (created_at)
+      )
+      `
+    )
+
+    await conn.query(
+      `
+      INSERT INTO logs
+      (
+        user_id,
+        entity_type,
+        entity_id,
+        action,
+        amount,
+        metadata
+      )
+      VALUES (?, ?, ?, ?, ?, ?)
+      `,
+      [
+        userId || null,
+        'withdrawal',
+        withdrawalId,
+        parsedAction === 'approve' ? 'admin_withdraw_approved' : 'admin_withdraw_cancelled',
+        Number(amount.toFixed(2)),
+        JSON.stringify({
+          adminId: Number(req.authUser?.id ?? 0),
+          refundOnCancel: shouldRefund,
+          refunded,
+          previousStatus: currentStatus,
+          nextStatus,
+          provider: parsedAction === 'approve' ? parsedProvider : null,
+          providerTransactionId,
+        }),
+      ]
+    )
+
+    await conn.commit()
+
+    res.json({
+      ok: true,
+      message: parsedAction === 'approve'
+        ? `Saque aprovado com sucesso via ${parsedProvider.toUpperCase()}.`
+        : refunded
+          ? 'Saque cancelado e valor estornado com sucesso.'
+          : 'Saque cancelado sem estorno.',
+      withdrawal: {
+        id: withdrawalId,
+        status: nextStatus,
+        provider: parsedAction === 'approve' ? parsedProvider : null,
+        providerTransactionId: parsedAction === 'approve' ? providerTransactionId : null,
+      },
+      refunded,
+    })
+  } catch (err) {
+    await conn.rollback()
+    console.error('[admin-withdrawals-action]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao atualizar saque.' })
+  } finally {
+    conn.release()
   }
 })
 
