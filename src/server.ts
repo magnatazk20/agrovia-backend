@@ -3277,6 +3277,17 @@ app.post('/api/withdraw/request', async (req, res) => {
       `
     )
 
+    try {
+      await conn.query(
+        `
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
     const [configRows] = await conn.query<RowDataPacket[]>(
       `
       SELECT withdraw_auto_approve AS withdrawAutoApprove
@@ -4279,6 +4290,17 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
       `
     )
 
+    try {
+      await pool.query(
+        `
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
@@ -4383,6 +4405,17 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
       )
       `
     )
+
+    try {
+      await pool.query(
+        `
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
 
     const [rows] = await pool.query<RowDataPacket[]>(
       'SELECT id FROM system_withdraw_config ORDER BY id ASC LIMIT 1'
