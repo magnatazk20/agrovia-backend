@@ -3262,6 +3262,32 @@ app.post('/api/withdraw/request', async (req, res) => {
       `
     )
 
+    await conn.query(
+      `
+      CREATE TABLE IF NOT EXISTS system_withdraw_config (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        withdraw_fee_percent DECIMAL(8,2) NOT NULL DEFAULT 0.00,
+        min_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        max_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+      )
+      `
+    )
+
+    const [configRows] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT withdraw_auto_approve AS withdrawAutoApprove
+      FROM system_withdraw_config
+      ORDER BY id ASC
+      LIMIT 1
+      `
+    )
+
+    const shouldAutoApprove = Number(configRows[0]?.withdrawAutoApprove ?? 0) === 1
+
     const oldBalance = Number(currentBalance.toFixed(2))
     const newBalance = Number((oldBalance - parsedAmount).toFixed(2))
 
@@ -3275,6 +3301,58 @@ app.post('/api/withdraw/request', async (req, res) => {
     )
 
     const externalId = `WD-${Date.now()}-${parsedUserId}`
+    let withdrawStatus: 'pending' | 'processing' | 'paid' | 'failed' = 'pending'
+    let providerTransactionId: string | null = null
+    let providerPayload: any = null
+
+    if (shouldAutoApprove) {
+      const lumopayPixType = mapPixTypeToLumopay(pixKeyType)
+      const lumopayPixKey = normalizeLumopayPixKey(pixKey, lumopayPixType)
+
+      const cashoutPayload = {
+        amount: Number(parsedAmount.toFixed(2)),
+        pixKey: lumopayPixKey,
+        pixKeyType: lumopayPixType,
+        description: `Saque PIX auto #${externalId}`,
+      }
+
+      const providerRes = await fetch(LUMOPAY_TRANSFER_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': LUMO_API_KEY,
+        },
+        body: JSON.stringify(cashoutPayload),
+      })
+
+      providerPayload = await providerRes.json().catch(() => ({}))
+
+      if (!providerRes.ok || providerPayload?.success === false) {
+        throw new Error(String(providerPayload?.message ?? providerPayload?.error ?? 'Falha ao processar saque automático na Lumopay.'))
+      }
+
+      providerTransactionId =
+        String(
+          providerPayload?.data?.external_id ??
+          providerPayload?.data?.transaction_id ??
+          providerPayload?.transaction_id ??
+          providerPayload?.idTransaction ??
+          ''
+        ).trim() || null
+
+      const providerStatusRaw = String(
+        providerPayload?.data?.status ??
+        providerPayload?.status ??
+        'processing'
+      ).toLowerCase()
+
+      withdrawStatus =
+        providerStatusRaw === 'paid' || providerStatusRaw === 'payment.paid'
+          ? 'paid'
+          : providerStatusRaw === 'failed' || providerStatusRaw === 'canceled' || providerStatusRaw === 'cancelled'
+            ? 'failed'
+            : 'processing'
+    }
 
     const [insertResult] = await conn.query(
       `
@@ -3286,10 +3364,13 @@ app.post('/api/withdraw/request', async (req, res) => {
         holder_cpf,
         pix_key_type,
         pix_key,
+        provider_transaction_id,
         status,
-        external_id
+        external_id,
+        provider_payload,
+        paid_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         parsedUserId,
@@ -3298,7 +3379,11 @@ app.post('/api/withdraw/request', async (req, res) => {
         holderCpf,
         pixKeyType,
         pixKey,
+        providerTransactionId,
+        withdrawStatus,
         externalId,
+        providerPayload ? JSON.stringify(providerPayload) : null,
+        withdrawStatus === 'paid' ? new Date() : null,
       ]
     ) as any
 
@@ -3321,13 +3406,15 @@ app.post('/api/withdraw/request', async (req, res) => {
         parsedUserId,
         'withdrawal',
         Number(insertResult?.insertId ?? 0),
-        'withdraw_request_created',
+        shouldAutoApprove ? 'withdraw_request_auto_processed' : 'withdraw_request_created',
         oldBalance,
         newBalance,
         Number(parsedAmount.toFixed(2)),
         JSON.stringify({
-          status: 'pending',
+          status: withdrawStatus,
           externalId,
+          autoApprove: shouldAutoApprove,
+          providerTransactionId,
         }),
       ]
     )
@@ -3336,13 +3423,16 @@ app.post('/api/withdraw/request', async (req, res) => {
 
     res.json({
       ok: true,
-      message: 'Solicitação de saque enviada com sucesso.',
+      message: shouldAutoApprove
+        ? 'Solicitação de saque enviada e processada automaticamente.'
+        : 'Solicitação de saque enviada com sucesso.',
       withdraw: {
         id: Number(insertResult?.insertId ?? 0),
         amount: Number(parsedAmount.toFixed(2)),
-        status: 'pending',
-        transactionId: null,
-        externalId: `WD-${Date.now()}-${parsedUserId}`,
+        status: withdrawStatus,
+        transactionId: providerTransactionId,
+        externalId,
+        autoApprove: shouldAutoApprove,
       },
     })
   } catch (err) {
@@ -4181,6 +4271,7 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
         withdraw_fee_percent DECIMAL(8,2) NOT NULL DEFAULT 0.00,
         min_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         max_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id)
@@ -4194,7 +4285,8 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
         id,
         withdraw_fee_percent AS withdrawFeePercent,
         min_withdraw_amount AS minWithdrawAmount,
-        max_withdraw_amount AS maxWithdrawAmount
+        max_withdraw_amount AS maxWithdrawAmount,
+        withdraw_auto_approve AS withdrawAutoApprove
       FROM system_withdraw_config
       ORDER BY id ASC
       LIMIT 1
@@ -4205,8 +4297,8 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
       await pool.query(
         `
         INSERT INTO system_withdraw_config
-          (withdraw_fee_percent, min_withdraw_amount, max_withdraw_amount)
-        VALUES (0.00, 0.00, 0.00)
+          (withdraw_fee_percent, min_withdraw_amount, max_withdraw_amount, withdraw_auto_approve)
+        VALUES (0.00, 0.00, 0.00, 0)
         `
       )
 
@@ -4216,6 +4308,7 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
           withdrawFeePercent: 0,
           minWithdrawAmount: 0,
           maxWithdrawAmount: 0,
+          withdrawAutoApprove: false,
         },
       })
       return
@@ -4228,6 +4321,7 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
         withdrawFeePercent: Number(row.withdrawFeePercent ?? 0),
         minWithdrawAmount: Number(row.minWithdrawAmount ?? 0),
         maxWithdrawAmount: Number(row.maxWithdrawAmount ?? 0),
+        withdrawAutoApprove: Number(row.withdrawAutoApprove ?? 0) === 1,
       },
     })
   } catch (err) {
@@ -4237,15 +4331,22 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
 })
 
 app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
-  const { withdrawFeePercent, minWithdrawAmount, maxWithdrawAmount } = req.body as {
+  const { withdrawFeePercent, minWithdrawAmount, maxWithdrawAmount, withdrawAutoApprove } = req.body as {
     withdrawFeePercent?: number | string
     minWithdrawAmount?: number | string
     maxWithdrawAmount?: number | string
+    withdrawAutoApprove?: boolean | number | string
   }
 
   const fee = Number(String(withdrawFeePercent ?? 0).replace(',', '.'))
   const min = Number(String(minWithdrawAmount ?? 0).replace(',', '.'))
   const max = Number(String(maxWithdrawAmount ?? 0).replace(',', '.'))
+  const autoApprove =
+    withdrawAutoApprove === true ||
+    withdrawAutoApprove === 1 ||
+    String(withdrawAutoApprove ?? '').toLowerCase() === 'true'
+      ? 1
+      : 0
 
   if (!Number.isFinite(fee) || fee < 0) {
     res.status(400).json({ ok: false, error: 'Taxa de saque inválida.' })
@@ -4275,6 +4376,7 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
         withdraw_fee_percent DECIMAL(8,2) NOT NULL DEFAULT 0.00,
         min_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         max_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id)
@@ -4294,10 +4396,10 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
       await pool.query(
         `
         INSERT INTO system_withdraw_config
-          (withdraw_fee_percent, min_withdraw_amount, max_withdraw_amount)
-        VALUES (?, ?, ?)
+          (withdraw_fee_percent, min_withdraw_amount, max_withdraw_amount, withdraw_auto_approve)
+        VALUES (?, ?, ?, ?)
         `,
-        [normalizedFee, normalizedMin, normalizedMax]
+        [normalizedFee, normalizedMin, normalizedMax, autoApprove]
       )
     } else {
       await pool.query(
@@ -4307,10 +4409,11 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
           withdraw_fee_percent = ?,
           min_withdraw_amount = ?,
           max_withdraw_amount = ?,
+          withdraw_auto_approve = ?,
           updated_at = NOW()
         WHERE id = ?
         `,
-        [normalizedFee, normalizedMin, normalizedMax, Number(rows[0].id)]
+        [normalizedFee, normalizedMin, normalizedMax, autoApprove, Number(rows[0].id)]
       )
     }
 
@@ -4321,6 +4424,7 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
         withdrawFeePercent: normalizedFee,
         minWithdrawAmount: normalizedMin,
         maxWithdrawAmount: normalizedMax,
+        withdrawAutoApprove: autoApprove === 1,
       },
     })
   } catch (err) {
