@@ -3355,6 +3355,19 @@ app.post('/api/withdraw/request', async (req, res) => {
 })
 
 app.post('/api/withdraw/webhook', async (req, res) => {
+  const ip = String(req.headers['x-forwarded-for'] ?? req.socket.remoteAddress ?? 'ip-desconhecido')
+  const payload = (req.body ?? {}) as {
+    status?: string
+    amount?: number | string
+    pixKey?: string
+    idtransaction?: string
+    idTransaction?: string
+    transactionId?: string
+    providerTransactionId?: string
+    externalId?: string
+    id?: string
+  }
+
   try {
     await pool.query(
       `
@@ -3381,80 +3394,244 @@ app.post('/api/withdraw/webhook', async (req, res) => {
       `
     )
 
-    const payload = req.body as {
-      status?: string
-      transactionId?: string
-      providerTransactionId?: string
-      externalId?: string
-      id?: string
+    const statusOriginal = String(payload?.status ?? '').trim()
+    if (!statusOriginal) {
+      console.error('[withdraw-webhook] payload inválido sem status', { ip, payload })
+      res.status(400).json({ ok: false, error: 'Dados inválidos ou incompletos (status).' })
+      return
     }
 
-    const statusRaw = String(payload?.status ?? '').toLowerCase()
+    const statusUpper = statusOriginal.toUpperCase()
     const normalizedStatus =
-      statusRaw === 'paid' || statusRaw === 'payment.paid'
+      statusUpper === 'COMPLETED' || statusUpper === 'PAID' || statusUpper === 'PAYMENT.PAID'
         ? 'paid'
-        : statusRaw === 'failed' || statusRaw === 'canceled' || statusRaw === 'cancelled'
+        : statusUpper === 'CANCELLED' || statusUpper === 'CANCELED' || statusUpper === 'FAILED' || statusUpper === 'REJECTED'
           ? 'failed'
-          : statusRaw === 'processing'
+          : statusUpper === 'PROCESSING'
             ? 'processing'
             : 'pending'
 
-    const providerTransactionId =
-      String(payload?.providerTransactionId ?? payload?.transactionId ?? payload?.id ?? '').trim() || null
+    const amountRaw = Number(String(payload?.amount ?? '').replace(',', '.'))
+    const amount = Number.isFinite(amountRaw) ? Number(amountRaw.toFixed(2)) : null
+    const pixKey = String(payload?.pixKey ?? '').trim() || null
+
+    const providerTransactionId = String(
+      payload?.providerTransactionId ??
+      payload?.transactionId ??
+      payload?.idtransaction ??
+      payload?.idTransaction ??
+      payload?.id ??
+      ''
+    ).trim() || null
+
     const externalId = String(payload?.externalId ?? '').trim() || null
 
-    if (!providerTransactionId && !externalId) {
-      res.status(400).json({ ok: false, error: 'Webhook sem identificador de saque.' })
-      return
+    console.log('[withdraw-webhook] recebido', {
+      ip,
+      statusOriginal,
+      normalizedStatus,
+      amount,
+      pixKey,
+      providerTransactionId,
+      externalId,
+    })
+
+    let foundWithdrawal: RowDataPacket | null = null
+    let matchStrategy = 'none'
+
+    if (providerTransactionId) {
+      const [rowsByProviderId] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT id, user_id AS userId, amount, status, pix_key AS pixKey
+        FROM withdrawals
+        WHERE provider_transaction_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        `,
+        [providerTransactionId]
+      )
+      if (rowsByProviderId.length > 0) {
+        foundWithdrawal = rowsByProviderId[0]
+        matchStrategy = 'provider_transaction_id'
+      }
     }
 
-    const whereClause = providerTransactionId
-      ? 'provider_transaction_id = ?'
-      : 'external_id = ?'
-    const whereValue = providerTransactionId ?? externalId
-
-    const [rows] = await pool.query<RowDataPacket[]>(
-      `
-      SELECT id, status
-      FROM withdrawals
-      WHERE ${whereClause}
-      LIMIT 1
-      `,
-      [whereValue]
-    )
-
-    if (rows.length === 0) {
-      res.status(404).json({ ok: false, error: 'Saque não encontrado para atualizar.' })
-      return
+    if (!foundWithdrawal && externalId) {
+      const [rowsByExternalId] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT id, user_id AS userId, amount, status, pix_key AS pixKey
+        FROM withdrawals
+        WHERE external_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        `,
+        [externalId]
+      )
+      if (rowsByExternalId.length > 0) {
+        foundWithdrawal = rowsByExternalId[0]
+        matchStrategy = 'external_id'
+      }
     }
 
-    const row = rows[0]
-    const currentStatus = String(row.status ?? '').toLowerCase()
-    const shouldSetPaidAt = normalizedStatus === 'paid' && currentStatus !== 'paid'
+    if (!foundWithdrawal && pixKey) {
+      const [rowsByPix] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT id, user_id AS userId, amount, status, pix_key AS pixKey
+        FROM withdrawals
+        WHERE pix_key = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [pixKey]
+      )
+      if (rowsByPix.length > 0) {
+        foundWithdrawal = rowsByPix[0]
+        matchStrategy = 'pix_key'
+      }
+    }
 
-    await pool.query(
-      `
-      UPDATE withdrawals
-      SET
-        status = ?,
-        provider_transaction_id = COALESCE(?, provider_transaction_id),
-        external_id = COALESCE(?, external_id),
-        provider_payload = ?,
-        paid_at = CASE WHEN ? = 1 THEN NOW() ELSE paid_at END,
-        updated_at = NOW()
-      WHERE id = ?
-      `,
-      [
-        normalizedStatus,
+    if (!foundWithdrawal && amount != null) {
+      const [rowsByAmount] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT id, user_id AS userId, amount, status, pix_key AS pixKey
+        FROM withdrawals
+        WHERE ABS(amount - ?) < 1.0
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [amount]
+      )
+      if (rowsByAmount.length > 0) {
+        foundWithdrawal = rowsByAmount[0]
+        matchStrategy = 'amount_approx'
+      }
+    }
+
+    if (!foundWithdrawal) {
+      const [rowsMostRecent] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT id, user_id AS userId, amount, status, pix_key AS pixKey
+        FROM withdrawals
+        ORDER BY created_at DESC
+        LIMIT 1
+        `
+      )
+      if (rowsMostRecent.length > 0) {
+        foundWithdrawal = rowsMostRecent[0]
+        matchStrategy = 'most_recent'
+      }
+    }
+
+    if (!foundWithdrawal) {
+      console.error('[withdraw-webhook] saque não encontrado', {
+        ip,
+        statusOriginal,
+        amount,
+        pixKey,
         providerTransactionId,
         externalId,
-        JSON.stringify(payload),
-        shouldSetPaidAt ? 1 : 0,
-        Number(row.id),
-      ]
-    )
+      })
+      res.status(404).json({ ok: false, error: 'Saque não encontrado com os dados fornecidos.' })
+      return
+    }
 
-    res.json({ ok: true, message: 'Webhook de saque processado com sucesso.' })
+    const withdrawalId = Number(foundWithdrawal.id)
+    const userId = Number(foundWithdrawal.userId)
+    const currentStatus = String(foundWithdrawal.status ?? '').toLowerCase()
+    const withdrawalAmount = Number(foundWithdrawal.amount ?? 0)
+
+    console.log('[withdraw-webhook] saque encontrado', {
+      matchStrategy,
+      withdrawalId,
+      userId,
+      currentStatus,
+      withdrawalAmount,
+    })
+
+    const conn = await pool.getConnection()
+    try {
+      await conn.beginTransaction()
+
+      await conn.query(
+        `
+        UPDATE withdrawals
+        SET
+          status = ?,
+          provider_transaction_id = COALESCE(?, provider_transaction_id),
+          external_id = COALESCE(?, external_id),
+          provider_payload = ?,
+          paid_at = CASE WHEN ? = 'paid' AND paid_at IS NULL THEN NOW() ELSE paid_at END,
+          updated_at = NOW()
+        WHERE id = ?
+        `,
+        [
+          normalizedStatus,
+          providerTransactionId,
+          externalId,
+          JSON.stringify({
+            source: 'withdraw_webhook_legacy_compat',
+            ip,
+            matchStrategy,
+            payload,
+          }),
+          normalizedStatus,
+          withdrawalId,
+        ]
+      )
+
+      const shouldRefund =
+        normalizedStatus === 'failed' &&
+        currentStatus !== 'failed' &&
+        currentStatus !== 'cancelled' &&
+        currentStatus !== 'canceled' &&
+        withdrawalAmount > 0 &&
+        userId > 0
+
+      if (shouldRefund) {
+        await conn.query(
+          `
+          UPDATE users
+          SET balance = COALESCE(balance, 0) + ?
+          WHERE id = ?
+          `,
+          [withdrawalAmount, userId]
+        )
+        console.log('[withdraw-webhook] estorno realizado', {
+          withdrawalId,
+          userId,
+          refundAmount: withdrawalAmount,
+          refundRule: '100%',
+        })
+      }
+
+      await conn.commit()
+
+      console.log('[withdraw-webhook] atualizado com sucesso', {
+        withdrawalId,
+        previousStatus: currentStatus,
+        newStatus: normalizedStatus,
+        providerTransactionId,
+        externalId,
+        matchStrategy,
+      })
+
+      res.json({
+        ok: true,
+        message: 'Webhook de saque processado com sucesso.',
+        withdrawal: {
+          id: withdrawalId,
+          previousStatus: currentStatus,
+          newStatus: normalizedStatus,
+          matchStrategy,
+        },
+        refunded: shouldRefund,
+      })
+    } catch (err) {
+      await conn.rollback()
+      throw err
+    } finally {
+      conn.release()
+    }
   } catch (err) {
     console.error('[withdraw-webhook]', err)
     res.status(500).json({ ok: false, error: 'Erro ao processar webhook de saque.' })
