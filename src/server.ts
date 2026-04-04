@@ -4436,6 +4436,52 @@ app.get('/api/admin/withdrawals/latest', requireMaxAdmin, async (req, res) => {
   }
 })
 
+app.get('/api/admin/withdrawals/pending', requireMaxAdmin, async (_req, res) => {
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        w.id,
+        w.amount,
+        w.status,
+        w.created_at AS createdAt,
+        w.updated_at AS updatedAt,
+        w.paid_at AS paidAt,
+        u.id AS userId,
+        u.name AS userName,
+        u.phone AS userPhone
+      FROM withdrawals w
+      INNER JOIN users u ON u.id = w.user_id
+      WHERE LOWER(w.status) IN ('pending', 'processing')
+      ORDER BY w.id DESC
+      `
+    )
+
+    const withdrawals = rows.map((row) => ({
+      id: Number(row.id),
+      amount: Number(row.amount ?? 0),
+      status: String(row.status ?? 'pending').toLowerCase(),
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      paidAt: row.paidAt,
+      user: {
+        id: Number(row.userId),
+        name: String(row.userName ?? 'Usuário'),
+        phone: String(row.userPhone ?? ''),
+      },
+    }))
+
+    res.json({
+      ok: true,
+      total: withdrawals.length,
+      withdrawals,
+    })
+  } catch (err) {
+    console.error('[admin-withdrawals-pending]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar saques pendentes.' })
+  }
+})
+
 app.post('/api/admin/migrate-balance-columns', async (_req, res) => {
   try {
     const [balanceCols] = await pool.query<RowDataPacket[]>(
