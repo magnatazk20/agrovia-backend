@@ -3366,6 +3366,14 @@ app.post('/api/withdraw/webhook', async (req, res) => {
     providerTransactionId?: string
     externalId?: string
     id?: string
+    data?: {
+      status?: string
+      amount?: number | string
+      pix_key?: string
+      transaction_id?: string
+      external_id?: string
+      id?: string
+    }
   }
 
   try {
@@ -3394,7 +3402,7 @@ app.post('/api/withdraw/webhook', async (req, res) => {
       `
     )
 
-    const statusOriginal = String(payload?.status ?? '').trim()
+    const statusOriginal = String(payload?.status ?? payload?.data?.status ?? '').trim()
     if (!statusOriginal) {
       console.error('[withdraw-webhook] payload inválido sem status', { ip, payload })
       res.status(400).json({ ok: false, error: 'Dados inválidos ou incompletos (status).' })
@@ -3411,9 +3419,9 @@ app.post('/api/withdraw/webhook', async (req, res) => {
             ? 'processing'
             : 'pending'
 
-    const amountRaw = Number(String(payload?.amount ?? '').replace(',', '.'))
-    const amount = Number.isFinite(amountRaw) ? Number(amountRaw.toFixed(2)) : null
-    const pixKey = String(payload?.pixKey ?? '').trim() || null
+    const amountRaw = Number(String(payload?.amount ?? payload?.data?.amount ?? '').replace(',', '.'))
+    const amount = Number.isFinite(amountRaw) ? Number(Math.abs(amountRaw).toFixed(2)) : null
+    const pixKey = String(payload?.pixKey ?? payload?.data?.pix_key ?? '').trim() || null
 
     const providerTransactionId = String(
       payload?.providerTransactionId ??
@@ -3421,10 +3429,12 @@ app.post('/api/withdraw/webhook', async (req, res) => {
       payload?.idtransaction ??
       payload?.idTransaction ??
       payload?.id ??
+      payload?.data?.transaction_id ??
+      payload?.data?.id ??
       ''
     ).trim() || null
 
-    const externalId = String(payload?.externalId ?? '').trim() || null
+    const externalId = String(payload?.externalId ?? payload?.data?.external_id ?? '').trim() || null
 
     console.log('[withdraw-webhook] recebido', {
       ip,
