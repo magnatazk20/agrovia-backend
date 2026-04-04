@@ -2920,6 +2920,124 @@ app.post('/api/user/withdraw-password', async (req, res) => {
   }
 })
 
+app.post('/api/user/change-password', async (req, res) => {
+  const { userId, currentPassword, newPassword } = req.body as {
+    userId?: number
+    currentPassword?: string
+    newPassword?: string
+  }
+
+  const parsedUserId = Number(userId)
+  const parsedCurrentPassword = String(currentPassword ?? '').trim()
+  const parsedNewPassword = String(newPassword ?? '').trim()
+
+  if (!parsedUserId || Number.isNaN(parsedUserId)) {
+    res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  if (!parsedCurrentPassword) {
+    res.status(400).json({ ok: false, error: 'Senha atual é obrigatória.' })
+    return
+  }
+
+  if (!parsedNewPassword || parsedNewPassword.length < 6) {
+    res.status(400).json({ ok: false, error: 'A nova senha deve ter no mínimo 6 caracteres.' })
+    return
+  }
+
+  try {
+    const [users] = await pool.query<RowDataPacket[]>(
+      'SELECT id, password FROM users WHERE id = ? LIMIT 1',
+      [parsedUserId]
+    )
+
+    if (users.length === 0) {
+      res.status(404).json({ ok: false, error: 'Usuário não encontrado.' })
+      return
+    }
+
+    const currentHash = String(users[0].password ?? '')
+    const validCurrentPassword = await bcrypt.compare(parsedCurrentPassword, currentHash)
+    if (!validCurrentPassword) {
+      res.status(401).json({ ok: false, error: 'Senha atual incorreta.' })
+      return
+    }
+
+    const isSamePassword = await bcrypt.compare(parsedNewPassword, currentHash)
+    if (isSamePassword) {
+      res.status(400).json({ ok: false, error: 'A nova senha não pode ser igual à senha atual.' })
+      return
+    }
+
+    const newPasswordHash = await bcrypt.hash(parsedNewPassword, 10)
+
+    await pool.query(
+      `
+      UPDATE users
+      SET password = ?
+      WHERE id = ?
+      `,
+      [newPasswordHash, parsedUserId]
+    )
+
+    await pool.query(
+      `
+      CREATE TABLE IF NOT EXISTS logs (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NULL,
+        entity_type VARCHAR(60) NOT NULL,
+        entity_id BIGINT UNSIGNED NULL,
+        action VARCHAR(100) NOT NULL,
+        old_balance DECIMAL(12,2) NULL,
+        new_balance DECIMAL(12,2) NULL,
+        amount DECIMAL(12,2) NULL,
+        metadata JSON NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_logs_user_id (user_id),
+        KEY idx_logs_entity_type (entity_type),
+        KEY idx_logs_entity_id (entity_id),
+        KEY idx_logs_action (action),
+        KEY idx_logs_created_at (created_at)
+      )
+      `
+    )
+
+    await pool.query(
+      `
+      INSERT INTO logs
+      (
+        user_id,
+        entity_type,
+        entity_id,
+        action,
+        metadata
+      )
+      VALUES (?, ?, ?, ?, ?)
+      `,
+      [
+        parsedUserId,
+        'user',
+        parsedUserId,
+        'login_password_changed',
+        JSON.stringify({
+          source: 'profile_change_password',
+          changedAt: new Date().toISOString(),
+        }),
+      ]
+    )
+
+    res.json({
+      ok: true,
+      message: 'Senha de login alterada com sucesso.',
+    })
+  } catch (err) {
+    console.error('[user-change-password]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao alterar senha de login.' })
+  }
+})
+
 app.post('/api/withdraw/request', async (req, res) => {
   const { userId, amount, withdrawPassword } = req.body as {
     userId?: number
