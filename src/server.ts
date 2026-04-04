@@ -2216,9 +2216,11 @@ app.get('/api/earnings/records/:userId', async (req, res) => {
       [userId]
     )
 
-    const normalizeStatus = (statusRaw: unknown) => {
-      const value = String(statusRaw ?? '').toLowerCase()
+    const normalizeStatus = (statusRaw: unknown): 'paid' | 'pending' | 'processing' | 'failed' => {
+      const value = String(statusRaw ?? '').toLowerCase().trim()
       if (value === 'paid' || value === 'payment.paid') return 'paid'
+      if (value === 'processing') return 'processing'
+      if (value === 'failed' || value === 'canceled' || value === 'cancelled') return 'failed'
       return 'pending'
     }
 
@@ -2234,7 +2236,7 @@ app.get('/api/earnings/records/:userId', async (req, res) => {
     let withdrawals: Array<{
       id: number
       amount: number
-      status: 'paid' | 'pending'
+      status: 'paid' | 'pending' | 'processing' | 'failed'
       createdAt: unknown
       type: 'withdraw'
     }> = []
