@@ -3942,7 +3942,7 @@ app.post('/api/gift-codes/redeem', async (req, res) => {
   }
 })
 
-app.get('/api/admin/withdraw-config', requireMaxAdmin, async (_req, res) => {
+app.get('/api/admin/withdraw-config', async (_req, res) => {
   try {
     await pool.query(
       `
