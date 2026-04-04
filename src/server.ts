@@ -139,6 +139,7 @@ const settleExpiredCyclesForUser = async (userId: number) => {
 
   const conn = await pool.getConnection()
   try {
+    await ensureGiftCodeTables()
     await conn.beginTransaction()
 
     const [expiredRows] = await conn.query<RowDataPacket[]>(
@@ -3290,50 +3291,81 @@ app.post('/api/withdraw/webhook', async (req, res) => {
   }
 })
 
-app.get('/api/admin/gift-codes', requireMaxAdmin, async (_req, res) => {
+const ensureGiftCodeTables = async () => {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS gift_codes (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      code VARCHAR(50) NOT NULL,
+      reward_type VARCHAR(50) NOT NULL DEFAULT 'balance_credit',
+      reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      max_total_uses INT NOT NULL DEFAULT 1,
+      used_count INT NOT NULL DEFAULT 0,
+      notes VARCHAR(255) NULL,
+      is_active TINYINT(1) NOT NULL DEFAULT 1,
+      starts_at DATETIME NULL,
+      expires_at DATETIME NULL,
+      created_by_user_id BIGINT UNSIGNED NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_gift_codes_code (code),
+      KEY idx_gift_codes_active (is_active),
+      KEY idx_gift_codes_expires (expires_at)
+    )
+    `
+  )
+
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS gift_code_redemptions (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      gift_code_id BIGINT UNSIGNED NOT NULL,
+      user_id BIGINT UNSIGNED NOT NULL,
+      reward_type VARCHAR(50) NOT NULL DEFAULT 'balance_credit',
+      reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      reward_applied TINYINT(1) NOT NULL DEFAULT 0,
+      metadata JSON NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_gift_code_redemption_once (gift_code_id, user_id),
+      KEY idx_gift_code_redemptions_user (user_id),
+      KEY idx_gift_code_redemptions_code (gift_code_id)
+    )
+    `
+  )
+
   try {
     await pool.query(
       `
-      CREATE TABLE IF NOT EXISTS gift_codes (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-        code VARCHAR(50) NOT NULL,
-        reward_type VARCHAR(50) NOT NULL DEFAULT 'balance_credit',
-        reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-        max_total_uses INT NOT NULL DEFAULT 1,
-        used_count INT NOT NULL DEFAULT 0,
-        notes VARCHAR(255) NULL,
-        is_active TINYINT(1) NOT NULL DEFAULT 1,
-        starts_at DATETIME NULL,
-        expires_at DATETIME NULL,
-        created_by_user_id BIGINT UNSIGNED NULL,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
-        UNIQUE KEY uq_gift_codes_code (code),
-        KEY idx_gift_codes_active (is_active),
-        KEY idx_gift_codes_expires (expires_at)
-      )
+      ALTER TABLE gift_codes
+      ADD COLUMN starts_at DATETIME NULL
       `
     )
+  } catch {}
 
+  try {
     await pool.query(
       `
-      CREATE TABLE IF NOT EXISTS gift_code_redemptions (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-        gift_code_id BIGINT UNSIGNED NOT NULL,
-        user_id BIGINT UNSIGNED NOT NULL,
-        reward_type VARCHAR(50) NOT NULL DEFAULT 'balance_credit',
-        reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-        reward_applied TINYINT(1) NOT NULL DEFAULT 0,
-        metadata JSON NULL,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
-        UNIQUE KEY uq_gift_code_redemption_once (gift_code_id, user_id),
-        KEY idx_gift_code_redemptions_user (user_id),
-        KEY idx_gift_code_redemptions_code (gift_code_id)
-      )
+      ALTER TABLE gift_codes
+      ADD COLUMN expires_at DATETIME NULL
       `
     )
+  } catch {}
+
+  try {
+    await pool.query(
+      `
+      ALTER TABLE gift_codes
+      ADD COLUMN created_by_user_id BIGINT UNSIGNED NULL
+      `
+    )
+  } catch {}
+}
+
+app.get('/api/admin/gift-codes', requireMaxAdmin, async (_req, res) => {
+  try {
+    await ensureGiftCodeTables()
 
     const [rows] = await pool.query<RowDataPacket[]>(
       `
@@ -3420,48 +3452,7 @@ app.post('/api/admin/gift-codes', requireMaxAdmin, async (req: AuthenticatedRequ
   }
 
   try {
-    await pool.query(
-      `
-      CREATE TABLE IF NOT EXISTS gift_codes (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-        code VARCHAR(50) NOT NULL,
-        reward_type VARCHAR(50) NOT NULL DEFAULT 'balance_credit',
-        reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-        max_total_uses INT NOT NULL DEFAULT 1,
-        used_count INT NOT NULL DEFAULT 0,
-        notes VARCHAR(255) NULL,
-        is_active TINYINT(1) NOT NULL DEFAULT 1,
-        starts_at DATETIME NULL,
-        expires_at DATETIME NULL,
-        created_by_user_id BIGINT UNSIGNED NULL,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
-        UNIQUE KEY uq_gift_codes_code (code),
-        KEY idx_gift_codes_active (is_active),
-        KEY idx_gift_codes_expires (expires_at)
-      )
-      `
-    )
-
-    await pool.query(
-      `
-      CREATE TABLE IF NOT EXISTS gift_code_redemptions (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-        gift_code_id BIGINT UNSIGNED NOT NULL,
-        user_id BIGINT UNSIGNED NOT NULL,
-        reward_type VARCHAR(50) NOT NULL DEFAULT 'balance_credit',
-        reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-        reward_applied TINYINT(1) NOT NULL DEFAULT 0,
-        metadata JSON NULL,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
-        UNIQUE KEY uq_gift_code_redemption_once (gift_code_id, user_id),
-        KEY idx_gift_code_redemptions_user (user_id),
-        KEY idx_gift_code_redemptions_code (gift_code_id)
-      )
-      `
-    )
+    await ensureGiftCodeTables()
 
     const [result] = await pool.query(
       `
