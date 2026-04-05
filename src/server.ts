@@ -4823,6 +4823,14 @@ app.get('/api/admin/deposit-config', requireMaxAdmin, async (_req, res) => {
       // coluna já existe
     }
 
+    await pool.query(
+      `
+      UPDATE system_deposit_config
+      SET quick_preset_values = '20,50,100,200,500'
+      WHERE quick_preset_values IS NULL OR TRIM(quick_preset_values) = ''
+      `
+    )
+
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
@@ -4955,6 +4963,14 @@ app.post('/api/admin/deposit-config', requireMaxAdmin, async (req, res) => {
     } catch {
       // coluna já existe
     }
+
+    await pool.query(
+      `
+      UPDATE system_deposit_config
+      SET quick_preset_values = '20,50,100,200,500'
+      WHERE quick_preset_values IS NULL OR TRIM(quick_preset_values) = ''
+      `
+    )
 
     const [rows] = await pool.query<RowDataPacket[]>(
       'SELECT id FROM system_deposit_config ORDER BY id ASC LIMIT 1'
