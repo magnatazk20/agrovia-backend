@@ -2568,6 +2568,34 @@ app.post('/api/withdraw/request', async (req, res) => {
         KEY idx_logs_created_at (created_at)
       )
       `);
+        await conn.query(`
+      CREATE TABLE IF NOT EXISTS system_withdraw_config (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        withdraw_fee_percent DECIMAL(8,2) NOT NULL DEFAULT 0.00,
+        min_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        max_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+      )
+      `);
+        try {
+            await conn.query(`
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0
+        `);
+        }
+        catch {
+            // coluna já existe
+        }
+        const [configRows] = await conn.query(`
+      SELECT withdraw_auto_approve AS withdrawAutoApprove
+      FROM system_withdraw_config
+      ORDER BY id ASC
+      LIMIT 1
+      `);
+        const shouldAutoApprove = Number(configRows[0]?.withdrawAutoApprove ?? 0) === 1;
         const oldBalance = Number(currentBalance.toFixed(2));
         const newBalance = Number((oldBalance - parsedAmount).toFixed(2));
         await conn.query(`
@@ -2576,6 +2604,46 @@ app.post('/api/withdraw/request', async (req, res) => {
       WHERE id = ?
       `, [newBalance, parsedUserId]);
         const externalId = `WD-${Date.now()}-${parsedUserId}`;
+        let withdrawStatus = 'pending';
+        let providerTransactionId = null;
+        let providerPayload = null;
+        if (shouldAutoApprove) {
+            const lumopayPixType = mapPixTypeToLumopay(pixKeyType);
+            const lumopayPixKey = normalizeLumopayPixKey(pixKey, lumopayPixType);
+            const cashoutPayload = {
+                amount: Number(parsedAmount.toFixed(2)),
+                pixKey: lumopayPixKey,
+                pixKeyType: lumopayPixType,
+                description: `Saque PIX auto #${externalId}`,
+            };
+            const providerRes = await fetch(LUMOPAY_TRANSFER_URL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-key': LUMO_API_KEY,
+                },
+                body: JSON.stringify(cashoutPayload),
+            });
+            providerPayload = await providerRes.json().catch(() => ({}));
+            if (!providerRes.ok || providerPayload?.success === false) {
+                throw new Error(String(providerPayload?.message ?? providerPayload?.error ?? 'Falha ao processar saque automático na Lumopay.'));
+            }
+            providerTransactionId =
+                String(providerPayload?.data?.external_id ??
+                    providerPayload?.data?.transaction_id ??
+                    providerPayload?.transaction_id ??
+                    providerPayload?.idTransaction ??
+                    '').trim() || null;
+            const providerStatusRaw = String(providerPayload?.data?.status ??
+                providerPayload?.status ??
+                'processing').toLowerCase();
+            withdrawStatus =
+                providerStatusRaw === 'paid' || providerStatusRaw === 'payment.paid'
+                    ? 'paid'
+                    : providerStatusRaw === 'failed' || providerStatusRaw === 'canceled' || providerStatusRaw === 'cancelled'
+                        ? 'failed'
+                        : 'processing';
+        }
         const [insertResult] = await conn.query(`
       INSERT INTO withdrawals
       (
@@ -2585,10 +2653,13 @@ app.post('/api/withdraw/request', async (req, res) => {
         holder_cpf,
         pix_key_type,
         pix_key,
+        provider_transaction_id,
         status,
-        external_id
+        external_id,
+        provider_payload,
+        paid_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
             parsedUserId,
             Number(parsedAmount.toFixed(2)),
@@ -2596,7 +2667,11 @@ app.post('/api/withdraw/request', async (req, res) => {
             holderCpf,
             pixKeyType,
             pixKey,
+            providerTransactionId,
+            withdrawStatus,
             externalId,
+            providerPayload ? JSON.stringify(providerPayload) : null,
+            withdrawStatus === 'paid' ? new Date() : null,
         ]);
         await conn.query(`
       INSERT INTO logs
@@ -2615,25 +2690,30 @@ app.post('/api/withdraw/request', async (req, res) => {
             parsedUserId,
             'withdrawal',
             Number(insertResult?.insertId ?? 0),
-            'withdraw_request_created',
+            shouldAutoApprove ? 'withdraw_request_auto_processed' : 'withdraw_request_created',
             oldBalance,
             newBalance,
             Number(parsedAmount.toFixed(2)),
             JSON.stringify({
-                status: 'pending',
+                status: withdrawStatus,
                 externalId,
+                autoApprove: shouldAutoApprove,
+                providerTransactionId,
             }),
         ]);
         await conn.commit();
         res.json({
             ok: true,
-            message: 'Solicitação de saque enviada com sucesso.',
+            message: shouldAutoApprove
+                ? 'Solicitação de saque enviada e processada automaticamente.'
+                : 'Solicitação de saque enviada com sucesso.',
             withdraw: {
                 id: Number(insertResult?.insertId ?? 0),
                 amount: Number(parsedAmount.toFixed(2)),
-                status: 'pending',
-                transactionId: null,
-                externalId: `WD-${Date.now()}-${parsedUserId}`,
+                status: withdrawStatus,
+                transactionId: providerTransactionId,
+                externalId,
+                autoApprove: shouldAutoApprove,
             },
         });
     }
@@ -2875,6 +2955,59 @@ app.post('/api/withdraw/webhook', async (req, res) => {
         res.status(500).json({ ok: false, error: 'Erro ao processar webhook de saque.' });
     }
 });
+const ensureGiftVoucherTables = async () => {
+    await db_1.default.query(`
+    CREATE TABLE IF NOT EXISTS gift_vouchers (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      name VARCHAR(150) NOT NULL,
+      description TEXT NULL,
+      image_url VARCHAR(500) NULL,
+      price DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      discount_coupon VARCHAR(80) NOT NULL,
+      redeem_reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      is_active TINYINT(1) NOT NULL DEFAULT 1,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_gift_vouchers_discount_coupon (discount_coupon),
+      KEY idx_gift_vouchers_active (is_active)
+    )
+    `);
+    await db_1.default.query(`
+    CREATE TABLE IF NOT EXISTS gift_voucher_purchases (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id BIGINT UNSIGNED NOT NULL,
+      gift_voucher_id BIGINT UNSIGNED NOT NULL,
+      paid_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      discount_coupon VARCHAR(80) NOT NULL,
+      redeem_reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      generated_gift_code VARCHAR(50) NULL,
+      generated_gift_code_id BIGINT UNSIGNED NULL,
+      status ENUM('paid','cancelled') NOT NULL DEFAULT 'paid',
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_gift_voucher_purchases_user (user_id),
+      KEY idx_gift_voucher_purchases_voucher (gift_voucher_id),
+      KEY idx_gift_voucher_purchases_generated_code_id (generated_gift_code_id)
+    )
+    `);
+    const tryAlter = async (sql) => {
+        try {
+            await db_1.default.query(sql);
+        }
+        catch {
+            // já existe
+        }
+    };
+    await tryAlter(`
+    ALTER TABLE gift_voucher_purchases
+    ADD COLUMN generated_gift_code VARCHAR(50) NULL
+  `);
+    await tryAlter(`
+    ALTER TABLE gift_voucher_purchases
+    ADD COLUMN generated_gift_code_id BIGINT UNSIGNED NULL
+  `);
+};
 const ensureGiftCodeTables = async () => {
     await db_1.default.query(`
     CREATE TABLE IF NOT EXISTS gift_codes (
@@ -2951,10 +3084,313 @@ const ensureGiftCodeTables = async () => {
     MODIFY COLUMN reward_type VARCHAR(50) NOT NULL DEFAULT 'balance_credit'
   `);
     await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN is_listed_for_sale TINYINT(1) NOT NULL DEFAULT 0
+  `);
+    await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN image_url VARCHAR(500) NULL
+  `);
+    await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN sale_price DECIMAL(12,2) NULL
+  `);
+    await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN description TEXT NULL
+  `);
+    await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN discount_coupon VARCHAR(80) NULL
+  `);
+    await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN discount_percent DECIMAL(8,2) NULL
+  `);
+    await tryAlter(`
     ALTER TABLE gift_code_redemptions
     MODIFY COLUMN metadata JSON NULL
   `);
 };
+app.get('/api/gift-vouchers', requireAuth, async (_req, res) => {
+    try {
+        await ensureGiftCodeTables();
+        const [rows] = await db_1.default.query(`
+      SELECT
+        id,
+        code,
+        description,
+        image_url AS imageUrl,
+        sale_price AS salePrice,
+        discount_coupon AS discountCoupon,
+        discount_percent AS discountPercent,
+        reward_value AS redeemRewardValue,
+        max_total_uses AS maxTotalUses,
+        used_count AS usedCount,
+        is_active AS isActive,
+        is_listed_for_sale AS isListedForSale,
+        created_at AS createdAt
+      FROM gift_codes
+      WHERE is_active = 1
+        AND is_listed_for_sale = 1
+        AND sale_price IS NOT NULL
+        AND sale_price > 0
+        AND (max_total_uses <= 0 OR used_count < max_total_uses)
+      ORDER BY id DESC
+      `);
+        const vouchers = rows.map((row) => {
+            const salePrice = Number(row.salePrice ?? 0);
+            const discountPercentRaw = row.discountPercent == null ? null : Number(row.discountPercent);
+            const discountPercent = discountPercentRaw != null && Number.isFinite(discountPercentRaw) && discountPercentRaw > 0
+                ? Math.min(discountPercentRaw, 100)
+                : null;
+            const finalPrice = discountPercent != null
+                ? Number((salePrice * (1 - discountPercent / 100)).toFixed(2))
+                : salePrice;
+            return {
+                id: Number(row.id),
+                name: String(row.code ?? ''),
+                code: String(row.code ?? ''),
+                description: String(row.description ?? ''),
+                imageUrl: String(row.imageUrl ?? ''),
+                price: finalPrice,
+                originalPrice: salePrice,
+                discountCoupon: String(row.discountCoupon ?? ''),
+                discountPercent,
+                redeemRewardValue: Number(row.redeemRewardValue ?? 0),
+                maxTotalUses: Number(row.maxTotalUses ?? 0),
+                usedCount: Number(row.usedCount ?? 0),
+                remainingUses: Number(row.maxTotalUses ?? 0) > 0
+                    ? Math.max(Number(row.maxTotalUses ?? 0) - Number(row.usedCount ?? 0), 0)
+                    : null,
+                isActive: Number(row.isActive ?? 0) === 1,
+                isListedForSale: Number(row.isListedForSale ?? 0) === 1,
+                createdAt: row.createdAt ?? null,
+            };
+        });
+        res.json({ ok: true, vouchers });
+    }
+    catch (err) {
+        console.error('[gift-vouchers-list]', err);
+        res.status(500).json({ ok: false, error: 'Erro ao listar vales presentes.' });
+    }
+});
+app.post('/api/gift-vouchers', requireMaxAdmin, async (req, res) => {
+    const { name, description, imageUrl, price, discountCoupon, redeemRewardValue } = req.body;
+    const parsedName = String(name ?? '').trim();
+    const parsedDescription = String(description ?? '').trim();
+    const parsedImageUrl = String(imageUrl ?? '').trim();
+    const parsedPrice = Number(String(price ?? '0').replace(',', '.'));
+    const parsedDiscountCoupon = String(discountCoupon ?? '').trim().toUpperCase();
+    const parsedRedeemRewardValue = Number(String(redeemRewardValue ?? '0').replace(',', '.'));
+    if (!parsedName) {
+        res.status(400).json({ ok: false, error: 'Nome do vale é obrigatório.' });
+        return;
+    }
+    if (!parsedDiscountCoupon) {
+        res.status(400).json({ ok: false, error: 'Cupom de desconto é obrigatório.' });
+        return;
+    }
+    if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
+        res.status(400).json({ ok: false, error: 'Valor do vale inválido.' });
+        return;
+    }
+    if (!Number.isFinite(parsedRedeemRewardValue) || parsedRedeemRewardValue <= 0) {
+        res.status(400).json({ ok: false, error: 'Valor de resgate inválido.' });
+        return;
+    }
+    try {
+        await ensureGiftVoucherTables();
+        const [result] = await db_1.default.query(`
+      INSERT INTO gift_vouchers
+      (
+        name,
+        description,
+        image_url,
+        price,
+        discount_coupon,
+        redeem_reward_value,
+        is_active
+      )
+      VALUES (?, ?, ?, ?, ?, ?, 1)
+      `, [
+            parsedName,
+            parsedDescription || null,
+            parsedImageUrl || null,
+            Number(parsedPrice.toFixed(2)),
+            parsedDiscountCoupon,
+            Number(parsedRedeemRewardValue.toFixed(2)),
+        ]);
+        res.status(201).json({
+            ok: true,
+            message: 'Vale presente criado com sucesso.',
+            voucher: {
+                id: Number(result?.insertId ?? 0),
+                name: parsedName,
+                description: parsedDescription,
+                imageUrl: parsedImageUrl,
+                price: Number(parsedPrice.toFixed(2)),
+                discountCoupon: parsedDiscountCoupon,
+                redeemRewardValue: Number(parsedRedeemRewardValue.toFixed(2)),
+            },
+        });
+    }
+    catch (err) {
+        if (String(err?.code ?? '') === 'ER_DUP_ENTRY') {
+            res.status(409).json({ ok: false, error: 'Cupom já existe.' });
+            return;
+        }
+        console.error('[gift-vouchers-create]', err);
+        res.status(500).json({ ok: false, error: 'Erro ao criar vale presente.' });
+    }
+});
+app.post('/api/gift-vouchers/purchase', requireAuth, async (req, res) => {
+    const { userId, giftVoucherId } = req.body;
+    const parsedUserId = Number(userId);
+    const parsedGiftVoucherId = Number(giftVoucherId);
+    if (!parsedUserId || Number.isNaN(parsedUserId)) {
+        res.status(400).json({ ok: false, error: 'ID de usuário inválido.' });
+        return;
+    }
+    if (!parsedGiftVoucherId || Number.isNaN(parsedGiftVoucherId)) {
+        res.status(400).json({ ok: false, error: 'ID do vale inválido.' });
+        return;
+    }
+    if (Number(req.authUser?.id ?? 0) !== parsedUserId) {
+        res.status(403).json({ ok: false, error: 'Ação não permitida para este usuário.' });
+        return;
+    }
+    const conn = await db_1.default.getConnection();
+    try {
+        await ensureGiftVoucherTables();
+        await ensureGiftCodeTables();
+        await conn.beginTransaction();
+        const [userRows] = await conn.query('SELECT id, balance FROM users WHERE id = ? LIMIT 1 FOR UPDATE', [parsedUserId]);
+        if (userRows.length === 0) {
+            await conn.rollback();
+            res.status(404).json({ ok: false, error: 'Usuário não encontrado.' });
+            return;
+        }
+        const [giftCodeRows] = await conn.query(`
+      SELECT
+        id,
+        code,
+        reward_value AS rewardValue,
+        max_total_uses AS maxTotalUses,
+        used_count AS usedCount,
+        is_active AS isActive,
+        is_listed_for_sale AS isListedForSale,
+        sale_price AS salePrice,
+        discount_coupon AS discountCoupon,
+        discount_percent AS discountPercent
+      FROM gift_codes
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `, [parsedGiftVoucherId]);
+        if (giftCodeRows.length === 0) {
+            await conn.rollback();
+            res.status(404).json({ ok: false, error: 'Código não encontrado.' });
+            return;
+        }
+        const giftCode = giftCodeRows[0];
+        const isActive = Number(giftCode.isActive ?? 0) === 1;
+        const isListedForSale = Number(giftCode.isListedForSale ?? 0) === 1;
+        const maxTotalUses = Number(giftCode.maxTotalUses ?? 0);
+        const usedCount = Number(giftCode.usedCount ?? 0);
+        if (!isActive || !isListedForSale) {
+            await conn.rollback();
+            res.status(400).json({ ok: false, error: 'Este código não está disponível para venda.' });
+            return;
+        }
+        if (maxTotalUses > 0 && usedCount >= maxTotalUses) {
+            await conn.rollback();
+            res.status(400).json({ ok: false, error: 'Este código esgotou o limite de resgates.' });
+            return;
+        }
+        const salePriceRaw = Number(giftCode.salePrice ?? 0);
+        if (!Number.isFinite(salePriceRaw) || salePriceRaw <= 0) {
+            await conn.rollback();
+            res.status(400).json({ ok: false, error: 'Preço de venda inválido para este código.' });
+            return;
+        }
+        const discountPercentRaw = giftCode.discountPercent == null ? null : Number(giftCode.discountPercent);
+        const discountPercent = discountPercentRaw != null && Number.isFinite(discountPercentRaw) && discountPercentRaw > 0
+            ? Math.min(discountPercentRaw, 100)
+            : null;
+        const finalPrice = discountPercent != null
+            ? Number((salePriceRaw * (1 - discountPercent / 100)).toFixed(2))
+            : Number(salePriceRaw.toFixed(2));
+        const currentBalance = Number(userRows[0].balance ?? 0);
+        if (currentBalance < finalPrice) {
+            await conn.rollback();
+            res.status(400).json({
+                ok: false,
+                error: 'Saldo insuficiente para comprar este código.',
+                required: finalPrice,
+                available: currentBalance,
+            });
+            return;
+        }
+        const balanceAfter = Number((currentBalance - finalPrice).toFixed(2));
+        await conn.query(`
+      UPDATE users
+      SET balance = ?
+      WHERE id = ?
+      `, [balanceAfter, parsedUserId]);
+        const generatedGiftCode = String(giftCode.code ?? '').trim().toUpperCase();
+        const generatedGiftCodeId = Number(giftCode.id ?? 0);
+        const redeemRewardValue = Number(giftCode.rewardValue ?? 0);
+        const [purchaseResult] = await conn.query(`
+      INSERT INTO gift_voucher_purchases
+      (
+        user_id,
+        gift_voucher_id,
+        paid_amount,
+        discount_coupon,
+        redeem_reward_value,
+        generated_gift_code,
+        generated_gift_code_id,
+        status
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'paid')
+      `, [
+            parsedUserId,
+            parsedGiftVoucherId,
+            Number(finalPrice.toFixed(2)),
+            String(giftCode.discountCoupon ?? ''),
+            Number(redeemRewardValue.toFixed(2)),
+            generatedGiftCode,
+            generatedGiftCodeId || null,
+        ]);
+        await conn.commit();
+        res.json({
+            ok: true,
+            message: 'Código comprado com sucesso.',
+            generatedGiftCode,
+            purchase: {
+                id: Number(purchaseResult?.insertId ?? 0),
+                giftVoucherId: parsedGiftVoucherId,
+                name: generatedGiftCode,
+                paidAmount: Number(finalPrice.toFixed(2)),
+                originalPrice: Number(salePriceRaw.toFixed(2)),
+                discountPercent,
+                redeemRewardValue: Number(redeemRewardValue.toFixed(2)),
+                generatedGiftCode,
+            },
+            balanceBefore: Number(currentBalance.toFixed(2)),
+            balanceAfter,
+        });
+    }
+    catch (err) {
+        await conn.rollback();
+        console.error('[gift-vouchers-purchase]', err);
+        res.status(500).json({ ok: false, error: 'Erro ao comprar código.' });
+    }
+    finally {
+        conn.release();
+    }
+});
 app.get('/api/admin/gift-codes', requireMaxAdmin, async (_req, res) => {
     try {
         await ensureGiftCodeTables();
@@ -2971,6 +3407,12 @@ app.get('/api/admin/gift-codes', requireMaxAdmin, async (_req, res) => {
         starts_at AS startsAt,
         expires_at AS expiresAt,
         created_by_user_id AS createdByUserId,
+        is_listed_for_sale AS isListedForSale,
+        image_url AS imageUrl,
+        sale_price AS salePrice,
+        description,
+        discount_coupon AS discountCoupon,
+        discount_percent AS discountPercent,
         created_at AS createdAt
       FROM gift_codes
       ORDER BY id DESC
@@ -2987,6 +3429,12 @@ app.get('/api/admin/gift-codes', requireMaxAdmin, async (_req, res) => {
             startsAt: row.startsAt ?? null,
             expiresAt: row.expiresAt ?? null,
             createdByUserId: row.createdByUserId == null ? null : Number(row.createdByUserId),
+            isListedForSale: Number(row.isListedForSale ?? 0) === 1,
+            imageUrl: String(row.imageUrl ?? ''),
+            salePrice: row.salePrice == null ? null : Number(row.salePrice),
+            description: String(row.description ?? ''),
+            discountCoupon: String(row.discountCoupon ?? ''),
+            discountPercent: row.discountPercent == null ? null : Number(row.discountPercent),
             createdAt: row.createdAt ?? null,
         }));
         res.json({ ok: true, giftCodes });
@@ -3000,7 +3448,7 @@ app.get('/api/admin/gift-codes', requireMaxAdmin, async (_req, res) => {
     }
 });
 app.post('/api/admin/gift-codes', requireMaxAdmin, async (req, res) => {
-    const { code, rewardType, rewardValue, maxTotalUses, notes, startsAt, expiresAt, } = req.body;
+    const { code, rewardType, rewardValue, maxTotalUses, notes, startsAt, expiresAt, isListedForSale, imageUrl, salePrice, description, discountCoupon, discountPercent, productName, } = req.body;
     const normalizedCode = String(code ?? '').trim().toUpperCase();
     const normalizedRewardType = String(rewardType ?? 'balance_credit').trim() || 'balance_credit';
     const normalizedRewardValue = Number(String(rewardValue ?? '0').replace(',', '.'));
@@ -3008,6 +3456,19 @@ app.post('/api/admin/gift-codes', requireMaxAdmin, async (req, res) => {
     const normalizedNotes = String(notes ?? '').trim();
     const normalizedStartsAt = startsAt ? String(startsAt).trim() : null;
     const normalizedExpiresAt = expiresAt ? String(expiresAt).trim() : null;
+    const normalizedIsListedForSale = isListedForSale === true ||
+        isListedForSale === 1 ||
+        String(isListedForSale ?? '').toLowerCase() === 'true';
+    const normalizedImageUrl = String(imageUrl ?? '').trim();
+    const normalizedDescription = String(description ?? '').trim();
+    const normalizedProductName = String(productName ?? '').trim();
+    const normalizedDiscountCoupon = String(discountCoupon ?? '').trim().toUpperCase();
+    const normalizedSalePrice = salePrice == null || String(salePrice).trim() === ''
+        ? null
+        : Number(String(salePrice).replace(',', '.'));
+    const normalizedDiscountPercent = discountPercent == null || String(discountPercent).trim() === ''
+        ? null
+        : Number(String(discountPercent).replace(',', '.'));
     if (!normalizedCode) {
         res.status(400).json({ ok: false, error: 'Código é obrigatório.' });
         return;
@@ -3019,6 +3480,21 @@ app.post('/api/admin/gift-codes', requireMaxAdmin, async (req, res) => {
     if (!Number.isInteger(normalizedMaxTotalUses) || normalizedMaxTotalUses <= 0) {
         res.status(400).json({ ok: false, error: 'Limite máximo de usos inválido.' });
         return;
+    }
+    if (normalizedIsListedForSale) {
+        if (!normalizedDescription) {
+            res.status(400).json({ ok: false, error: 'Descrição é obrigatória para venda.' });
+            return;
+        }
+        if (!Number.isFinite(Number(normalizedSalePrice)) || Number(normalizedSalePrice) <= 0) {
+            res.status(400).json({ ok: false, error: 'Valor do vale presente inválido para venda.' });
+            return;
+        }
+        if (normalizedDiscountPercent != null &&
+            (!Number.isFinite(normalizedDiscountPercent) || normalizedDiscountPercent < 0 || normalizedDiscountPercent > 100)) {
+            res.status(400).json({ ok: false, error: 'Cupom de desconto (%) deve estar entre 0 e 100.' });
+            return;
+        }
     }
     try {
         await ensureGiftCodeTables();
@@ -3034,9 +3510,15 @@ app.post('/api/admin/gift-codes', requireMaxAdmin, async (req, res) => {
         is_active,
         starts_at,
         expires_at,
-        created_by_user_id
+        created_by_user_id,
+        is_listed_for_sale,
+        image_url,
+        sale_price,
+        description,
+        discount_coupon,
+        discount_percent
       )
-      VALUES (?, ?, ?, ?, 0, ?, 1, ?, ?, ?)
+      VALUES (?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
             normalizedCode,
             normalizedRewardType,
@@ -3046,6 +3528,12 @@ app.post('/api/admin/gift-codes', requireMaxAdmin, async (req, res) => {
             normalizedStartsAt || null,
             normalizedExpiresAt || null,
             Number(req.authUser?.id ?? 0) || null,
+            normalizedIsListedForSale ? 1 : 0,
+            normalizedImageUrl || null,
+            normalizedIsListedForSale ? Number(Number(normalizedSalePrice).toFixed(2)) : null,
+            normalizedDescription || null,
+            normalizedDiscountCoupon || null,
+            normalizedDiscountPercent == null ? null : Number(normalizedDiscountPercent.toFixed(2)),
         ]);
         res.status(201).json({
             ok: true,
@@ -3053,6 +3541,7 @@ app.post('/api/admin/gift-codes', requireMaxAdmin, async (req, res) => {
             giftCode: {
                 id: Number(result?.insertId ?? 0),
                 code: normalizedCode,
+                productName: normalizedProductName || normalizedCode,
                 rewardType: normalizedRewardType,
                 rewardValue: Number(normalizedRewardValue.toFixed(2)),
                 maxTotalUses: normalizedMaxTotalUses,
@@ -3060,6 +3549,12 @@ app.post('/api/admin/gift-codes', requireMaxAdmin, async (req, res) => {
                 notes: normalizedNotes,
                 startsAt: normalizedStartsAt,
                 expiresAt: normalizedExpiresAt,
+                isListedForSale: normalizedIsListedForSale,
+                imageUrl: normalizedImageUrl || null,
+                salePrice: normalizedIsListedForSale ? Number(Number(normalizedSalePrice).toFixed(2)) : null,
+                description: normalizedDescription || null,
+                discountCoupon: normalizedDiscountCoupon || null,
+                discountPercent: normalizedDiscountPercent == null ? null : Number(normalizedDiscountPercent.toFixed(2)),
             },
         });
     }
@@ -3298,17 +3793,28 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
         withdraw_fee_percent DECIMAL(8,2) NOT NULL DEFAULT 0.00,
         min_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         max_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id)
       )
       `);
+        try {
+            await db_1.default.query(`
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0
+        `);
+        }
+        catch {
+            // coluna já existe
+        }
         const [rows] = await db_1.default.query(`
       SELECT
         id,
         withdraw_fee_percent AS withdrawFeePercent,
         min_withdraw_amount AS minWithdrawAmount,
-        max_withdraw_amount AS maxWithdrawAmount
+        max_withdraw_amount AS maxWithdrawAmount,
+        withdraw_auto_approve AS withdrawAutoApprove
       FROM system_withdraw_config
       ORDER BY id ASC
       LIMIT 1
@@ -3316,8 +3822,8 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
         if (rows.length === 0) {
             await db_1.default.query(`
         INSERT INTO system_withdraw_config
-          (withdraw_fee_percent, min_withdraw_amount, max_withdraw_amount)
-        VALUES (0.00, 0.00, 0.00)
+          (withdraw_fee_percent, min_withdraw_amount, max_withdraw_amount, withdraw_auto_approve)
+        VALUES (0.00, 0.00, 0.00, 0)
         `);
             res.json({
                 ok: true,
@@ -3325,6 +3831,7 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
                     withdrawFeePercent: 0,
                     minWithdrawAmount: 0,
                     maxWithdrawAmount: 0,
+                    withdrawAutoApprove: false,
                 },
             });
             return;
@@ -3336,6 +3843,7 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
                 withdrawFeePercent: Number(row.withdrawFeePercent ?? 0),
                 minWithdrawAmount: Number(row.minWithdrawAmount ?? 0),
                 maxWithdrawAmount: Number(row.maxWithdrawAmount ?? 0),
+                withdrawAutoApprove: Number(row.withdrawAutoApprove ?? 0) === 1,
             },
         });
     }
@@ -3345,10 +3853,15 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
     }
 });
 app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
-    const { withdrawFeePercent, minWithdrawAmount, maxWithdrawAmount } = req.body;
+    const { withdrawFeePercent, minWithdrawAmount, maxWithdrawAmount, withdrawAutoApprove } = req.body;
     const fee = Number(String(withdrawFeePercent ?? 0).replace(',', '.'));
     const min = Number(String(minWithdrawAmount ?? 0).replace(',', '.'));
     const max = Number(String(maxWithdrawAmount ?? 0).replace(',', '.'));
+    const autoApprove = withdrawAutoApprove === true ||
+        withdrawAutoApprove === 1 ||
+        String(withdrawAutoApprove ?? '').toLowerCase() === 'true'
+        ? 1
+        : 0;
     if (!Number.isFinite(fee) || fee < 0) {
         res.status(400).json({ ok: false, error: 'Taxa de saque inválida.' });
         return;
@@ -3372,11 +3885,21 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
         withdraw_fee_percent DECIMAL(8,2) NOT NULL DEFAULT 0.00,
         min_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         max_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id)
       )
       `);
+        try {
+            await db_1.default.query(`
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0
+        `);
+        }
+        catch {
+            // coluna já existe
+        }
         const [rows] = await db_1.default.query('SELECT id FROM system_withdraw_config ORDER BY id ASC LIMIT 1');
         const normalizedFee = Number(fee.toFixed(2));
         const normalizedMin = Number(min.toFixed(2));
@@ -3384,9 +3907,9 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
         if (rows.length === 0) {
             await db_1.default.query(`
         INSERT INTO system_withdraw_config
-          (withdraw_fee_percent, min_withdraw_amount, max_withdraw_amount)
-        VALUES (?, ?, ?)
-        `, [normalizedFee, normalizedMin, normalizedMax]);
+          (withdraw_fee_percent, min_withdraw_amount, max_withdraw_amount, withdraw_auto_approve)
+        VALUES (?, ?, ?, ?)
+        `, [normalizedFee, normalizedMin, normalizedMax, autoApprove]);
         }
         else {
             await db_1.default.query(`
@@ -3395,9 +3918,10 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
           withdraw_fee_percent = ?,
           min_withdraw_amount = ?,
           max_withdraw_amount = ?,
+          withdraw_auto_approve = ?,
           updated_at = NOW()
         WHERE id = ?
-        `, [normalizedFee, normalizedMin, normalizedMax, Number(rows[0].id)]);
+        `, [normalizedFee, normalizedMin, normalizedMax, autoApprove, Number(rows[0].id)]);
         }
         res.json({
             ok: true,
@@ -3406,6 +3930,7 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
                 withdrawFeePercent: normalizedFee,
                 minWithdrawAmount: normalizedMin,
                 maxWithdrawAmount: normalizedMax,
+                withdrawAutoApprove: autoApprove === 1,
             },
         });
     }
