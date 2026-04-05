@@ -4262,6 +4262,133 @@ app.get('/api/admin/deposits', requireMaxAdmin, async (req, res) => {
         res.status(500).json({ ok: false, error: 'Erro ao carregar entradas de pagamentos.' });
     }
 });
+app.post('/api/admin/deposits/:id/action', requireMaxAdmin, async (req, res) => {
+    const depositId = Number(req.params.id);
+    const { action } = (req.body ?? {});
+    const parsedAction = String(action ?? '').trim().toLowerCase();
+    if (!depositId || Number.isNaN(depositId)) {
+        res.status(400).json({ ok: false, error: 'ID do depósito inválido.' });
+        return;
+    }
+    if (!['approve', 'cancel'].includes(parsedAction)) {
+        res.status(400).json({ ok: false, error: 'Ação inválida. Use approve ou cancel.' });
+        return;
+    }
+    const conn = await db_1.default.getConnection();
+    try {
+        await conn.beginTransaction();
+        const [depositRows] = await conn.query(`
+      SELECT
+        id,
+        user_id AS userId,
+        amount,
+        status
+      FROM cashin_payments
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `, [depositId]);
+        if (depositRows.length === 0) {
+            await conn.rollback();
+            res.status(404).json({ ok: false, error: 'Depósito não encontrado.' });
+            return;
+        }
+        const deposit = depositRows[0];
+        const userId = Number(deposit.userId ?? 0);
+        const amount = Number(deposit.amount ?? 0);
+        const currentStatus = String(deposit.status ?? '').toLowerCase();
+        const isCurrentlyPaid = currentStatus === 'paid' || currentStatus === 'payment.paid';
+        const [userRows] = await conn.query(`
+      SELECT id, balance, total_deposits AS totalDeposits
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `, [userId]);
+        if (userRows.length === 0) {
+            await conn.rollback();
+            res.status(404).json({ ok: false, error: 'Usuário do depósito não encontrado.' });
+            return;
+        }
+        const currentBalance = Number(userRows[0].balance ?? 0);
+        const currentTotalDeposits = Number(userRows[0].totalDeposits ?? 0);
+        if (parsedAction === 'approve') {
+            if (!isCurrentlyPaid) {
+                await conn.query(`
+          UPDATE cashin_payments
+          SET status = 'paid', paid_at = COALESCE(paid_at, NOW()), updated_at = NOW()
+          WHERE id = ?
+          `, [depositId]);
+                await conn.query(`
+          UPDATE users
+          SET
+            balance = COALESCE(balance, 0) + ?,
+            total_deposits = COALESCE(total_deposits, 0) + ?
+          WHERE id = ?
+          `, [amount, amount, userId]);
+            }
+            await conn.commit();
+            res.json({
+                ok: true,
+                message: isCurrentlyPaid ? 'Depósito já estava aprovado.' : 'Depósito aprovado e saldo creditado.',
+                deposit: {
+                    id: depositId,
+                    status: 'paid',
+                },
+            });
+            return;
+        }
+        // cancel
+        if (!isCurrentlyPaid) {
+            await conn.rollback();
+            res.status(400).json({
+                ok: false,
+                error: 'Apenas depósitos aprovados/pagos podem ser cancelados com débito em conta.',
+            });
+            return;
+        }
+        await conn.query(`
+      UPDATE cashin_payments
+      SET status = 'failed', updated_at = NOW()
+      WHERE id = ?
+      `, [depositId]);
+        const nextBalance = Number((currentBalance - amount).toFixed(2));
+        const nextTotalDeposits = Number((currentTotalDeposits - amount).toFixed(2));
+        if (nextBalance < 0 || nextTotalDeposits < 0) {
+            await conn.rollback();
+            res.status(400).json({
+                ok: false,
+                error: 'Não foi possível cancelar: saldo/depósitos do usuário insuficientes para débito.',
+            });
+            return;
+        }
+        await conn.query(`
+      UPDATE users
+      SET
+        balance = ?,
+        total_deposits = ?
+      WHERE id = ?
+      `, [nextBalance, nextTotalDeposits, userId]);
+        await conn.commit();
+        res.json({
+            ok: true,
+            message: 'Depósito cancelado e valor removido da conta do usuário.',
+            deposit: {
+                id: depositId,
+                status: 'failed',
+            },
+            debitedFromUser: true,
+        });
+    }
+    catch (err) {
+        await conn.rollback();
+        console.error('[admin-deposits-action]', err);
+        res.status(500).json({ ok: false, error: 'Erro ao processar ação do depósito.' });
+    }
+    finally {
+        conn.release();
+    }
+});
 app.get('/api/admin/withdrawals/latest', requireMaxAdmin, async (req, res) => {
     const rawLimit = Number(req.query.limit ?? 10);
     const limit = Math.min(Math.max(rawLimit, 1), 50);
