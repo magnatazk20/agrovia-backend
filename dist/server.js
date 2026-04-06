@@ -5596,16 +5596,30 @@ app.get('/api/admin/users', requireMaxAdmin, async (_req, res) => {
       ALTER TABLE users
       ADD COLUMN is_banned TINYINT(1) NOT NULL DEFAULT 0
       `).catch(() => null);
+        await db_1.default.query(`
+      ALTER TABLE users
+      ADD COLUMN balance DECIMAL(12,2) NOT NULL DEFAULT 0.00
+      `).catch(() => null);
+        await db_1.default.query(`
+      ALTER TABLE users
+      ADD COLUMN referred_by_user_id BIGINT UNSIGNED NULL
+      `).catch(() => null);
         const [rows] = await db_1.default.query(`
       SELECT
-        id,
-        name,
-        phone,
-        is_admin,
-        COALESCE(is_banned, 0) AS is_banned,
-        created_at
-      FROM users
-      ORDER BY id DESC
+        u.id,
+        u.name,
+        u.phone,
+        u.is_admin,
+        COALESCE(u.is_banned, 0) AS is_banned,
+        COALESCE(u.balance, 0) AS balance,
+        u.referred_by_user_id,
+        ref.id AS referrer_id,
+        ref.name AS referrer_name,
+        ref.phone AS referrer_phone,
+        u.created_at
+      FROM users u
+      LEFT JOIN users ref ON ref.id = u.referred_by_user_id
+      ORDER BY u.id DESC
       `);
         res.json({ ok: true, users: rows });
     }
