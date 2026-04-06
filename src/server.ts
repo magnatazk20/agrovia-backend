@@ -158,6 +158,21 @@ const resolveAuthUser = async (req: Request) => {
   }
 }
 
+const ensureTelegramConfigTable = async () => {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS system_telegram_config (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      bot_token VARCHAR(255) NOT NULL DEFAULT '',
+      group_id VARCHAR(255) NOT NULL DEFAULT '',
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id)
+    )
+    `
+  )
+}
+
 const requireAuth = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   const authUser = await resolveAuthUser(req)
   if (!authUser) {
@@ -256,6 +271,14 @@ const settleExpiredCyclesForUser = async (userId: number) => {
 
 app.use(cors())
 app.use(express.json())
+
+const bootstrapDatabase = async () => {
+  await ensureTelegramConfigTable()
+}
+
+bootstrapDatabase().catch((err) => {
+  console.error('[bootstrap-database]', err)
+})
 
 // ─── Health check ────────────────────────────────────────────────────────────
 app.get('/api/health', async (_req, res) => {
@@ -5802,18 +5825,7 @@ app.get('/api/site-settings', async (_req, res) => {
 
 app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
   try {
-    await pool.query(
-      `
-      CREATE TABLE IF NOT EXISTS system_telegram_config (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-        bot_token VARCHAR(255) NOT NULL DEFAULT '',
-        group_id VARCHAR(255) NOT NULL DEFAULT '',
-        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id)
-      )
-      `
-    )
+    await ensureTelegramConfigTable()
 
     const [rows] = await pool.query<RowDataPacket[]>(
       `
@@ -5873,18 +5885,7 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
   }
 
   try {
-    await pool.query(
-      `
-      CREATE TABLE IF NOT EXISTS system_telegram_config (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-        bot_token VARCHAR(255) NOT NULL DEFAULT '',
-        group_id VARCHAR(255) NOT NULL DEFAULT '',
-        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id)
-      )
-      `
-    )
+    await ensureTelegramConfigTable()
 
     const [rows] = await pool.query<RowDataPacket[]>(
       'SELECT id FROM system_telegram_config ORDER BY id ASC LIMIT 1'

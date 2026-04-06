@@ -1,4 +1,5 @@
-- [x] Adicionar função ensureCommissionLevelsTable no src/server.ts
-- [x] Integrar criação da tabela de comissões no fluxo de migração
-- [x] Validar build do backend
-- [ ] Commit e push das alterações
+- [ ] Validar conexão/configuração do banco em `src/db.ts` e variáveis de ambiente usadas pelo backend.
+- [ ] Reforçar criação da tabela `system_telegram_config` no bootstrap do servidor (inicialização), não apenas no endpoint.
+- [ ] Ajustar endpoint GET/POST de Telegram para reutilizar função de garantia de schema.
+- [ ] Testar build/execução do backend para validar a correção.
+- [ ] Commitar e dar push das alterações.
