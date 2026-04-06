@@ -1,5 +1,7 @@
-- [ ] Restringir vínculo Telegram apenas ao chat privado (bloquear grupos).
-- [ ] Impedir reconexão de conta já vinculada por outro Telegram/chat.
-- [ ] Garantir mensagem de sucesso clara ao conectar conta no privado.
-- [ ] Executar build e validar funcionamento básico.
-- [ ] Commitar e dar push das alterações.
+- [x] Mapear pontos do backend/frontend para Telegram config
+- [ ] Atualizar backend para suportar welcome_message na system_telegram_config
+- [ ] Ajustar /api/admin/telegram-config GET/POST para welcomeMessage
+- [ ] Implementar resposta ao /start no privado com mensagem configurável
+- [ ] Atualizar página AdminTelegramConfig com campo de mensagem de boas-vindas
+- [ ] Validar build do backend
+- [ ] Commit e push das alterações

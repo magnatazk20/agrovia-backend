@@ -31,6 +31,7 @@ const SAO_PAULO_TZ = 'America/Sao_Paulo'
 let telegramPollingStarted = false
 let telegramPollingInterval: NodeJS.Timeout | null = null
 let telegramUpdateOffset = 0
+const telegramProcessedMessageKeys = new Set<string>()
 
 const getSaoPauloDateString = () =>
   new Intl.DateTimeFormat('en-CA', {
@@ -169,6 +170,7 @@ const ensureTelegramConfigTable = async () => {
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
       bot_token VARCHAR(255) NOT NULL DEFAULT '',
       group_id VARCHAR(255) NOT NULL DEFAULT '',
+      welcome_message TEXT NULL,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id)
@@ -220,6 +222,13 @@ const sendTelegramMessage = async (botToken: string, chatId: string, text: strin
   }
 }
 
+const getDefaultTelegramWelcomeMessage = () =>
+  [
+    'Bem-vindo ao bot oficial.',
+    'Envie /start para iniciar a conexão.',
+    'Depois envie APENAS o telefone cadastrado na plataforma (ex.: 11999998888).',
+  ].join('\n')
+
 const processTelegramUpdates = async () => {
   try {
     await ensureTelegramConfigTable()
@@ -227,7 +236,7 @@ const processTelegramUpdates = async () => {
 
     const [configRows] = await pool.query<RowDataPacket[]>(
       `
-      SELECT bot_token AS botToken, group_id AS groupId
+      SELECT bot_token AS botToken, group_id AS groupId, welcome_message AS welcomeMessage
       FROM system_telegram_config
       WHERE TRIM(bot_token) <> ''
       ORDER BY id ASC
@@ -239,6 +248,8 @@ const processTelegramUpdates = async () => {
 
     const botToken = String(configRows[0].botToken ?? '').trim()
     const configuredGroupId = String(configRows[0].groupId ?? '').trim()
+    const configuredWelcomeMessage = String(configRows[0].welcomeMessage ?? '').trim()
+    const welcomeMessage = configuredWelcomeMessage || getDefaultTelegramWelcomeMessage()
     if (!botToken) return
 
     const updatesUrl = `https://api.telegram.org/bot${botToken}/getUpdates?timeout=25${telegramUpdateOffset > 0 ? `&offset=${telegramUpdateOffset}` : ''}`
@@ -258,11 +269,25 @@ const processTelegramUpdates = async () => {
 
       const chatId = String(message?.chat?.id ?? '').trim()
       const chatType = String(message?.chat?.type ?? '').trim().toLowerCase()
+      const messageId = Number(message?.message_id ?? 0)
       const telegramUserId = String(message?.from?.id ?? '').trim()
       const telegramUsername = String(message?.from?.username ?? '').trim() || null
       const telegramFirstName = String(message?.from?.first_name ?? '').trim() || null
       const textRaw = String(message?.text ?? '').trim()
       if (!chatId || !telegramUserId || !textRaw) continue
+      const textLower = textRaw.toLowerCase()
+
+      if (messageId > 0) {
+        const messageKey = `${chatId}:${messageId}`
+        if (telegramProcessedMessageKeys.has(messageKey)) {
+          continue
+        }
+        telegramProcessedMessageKeys.add(messageKey)
+        if (telegramProcessedMessageKeys.size > 2000) {
+          const firstKey = telegramProcessedMessageKeys.values().next().value as string | undefined
+          if (firstKey) telegramProcessedMessageKeys.delete(firstKey)
+        }
+      }
 
       if (configuredGroupId && chatId === configuredGroupId) {
         continue
@@ -277,12 +302,20 @@ const processTelegramUpdates = async () => {
         continue
       }
 
+      const isStartCommand =
+        textLower === '/start' || textLower.startsWith('/start@')
+
+      if (isStartCommand) {
+        await sendTelegramMessage(botToken, chatId, welcomeMessage)
+        continue
+      }
+
       const normalizedIncomingPhone = normalizePhoneForCompare(textRaw)
       if (!normalizedIncomingPhone) {
         await sendTelegramMessage(
           botToken,
           chatId,
-          'Envie o telefone cadastrado na plataforma para conectar sua conta.'
+          'Para conectar sua conta, envie APENAS o telefone cadastrado na plataforma (somente no privado do bot). Exemplo: 11999998888'
         )
         continue
       }
@@ -6114,6 +6147,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
       SELECT
         bot_token AS botToken,
         group_id AS groupId,
+        welcome_message AS welcomeMessage,
         updated_at AS updatedAt
       FROM system_telegram_config
       ORDER BY id ASC
@@ -6127,6 +6161,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
         config: {
           botToken: '',
           groupId: '',
+          welcomeMessage: getDefaultTelegramWelcomeMessage(),
           updatedAt: null,
         },
       })
@@ -6138,6 +6173,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
       config: {
         botToken: String(rows[0].botToken ?? ''),
         groupId: String(rows[0].groupId ?? ''),
+        welcomeMessage: String(rows[0].welcomeMessage ?? '') || getDefaultTelegramWelcomeMessage(),
         updatedAt: rows[0].updatedAt ?? null,
       },
     })
@@ -6148,13 +6184,16 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
 })
 
 app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
-  const { botToken, groupId } = req.body as {
+  const { botToken, groupId, welcomeMessage } = req.body as {
     botToken?: string
     groupId?: string
+    welcomeMessage?: string
   }
 
   const parsedBotToken = String(botToken ?? '').trim()
   const parsedGroupId = String(groupId ?? '').trim()
+  const parsedWelcomeMessageRaw = String(welcomeMessage ?? '').trim()
+  const parsedWelcomeMessage = parsedWelcomeMessageRaw || getDefaultTelegramWelcomeMessage()
 
   if (!parsedBotToken) {
     res.status(400).json({ ok: false, error: 'Bot token é obrigatório.' })
@@ -6176,10 +6215,10 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
     if (rows.length === 0) {
       await pool.query(
         `
-        INSERT INTO system_telegram_config (bot_token, group_id)
-        VALUES (?, ?)
+        INSERT INTO system_telegram_config (bot_token, group_id, welcome_message)
+        VALUES (?, ?, ?)
         `,
-        [parsedBotToken, parsedGroupId]
+        [parsedBotToken, parsedGroupId, parsedWelcomeMessage]
       )
     } else {
       await pool.query(
@@ -6188,10 +6227,11 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
         SET
           bot_token = ?,
           group_id = ?,
+          welcome_message = ?,
           updated_at = NOW()
         WHERE id = ?
         `,
-        [parsedBotToken, parsedGroupId, Number(rows[0].id)]
+        [parsedBotToken, parsedGroupId, parsedWelcomeMessage, Number(rows[0].id)]
       )
     }
 
@@ -6201,6 +6241,7 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
       config: {
         botToken: parsedBotToken,
         groupId: parsedGroupId,
+        welcomeMessage: parsedWelcomeMessage,
       },
     })
   } catch (err) {
