@@ -7374,6 +7374,7 @@ app.post('/api/admin/migrate-balance-columns', async (_req, res) => {
         bot_token VARCHAR(255) NOT NULL DEFAULT '',
         group_id VARCHAR(255) NOT NULL DEFAULT '',
         welcome_message TEXT NULL,
+        private_chat_only_message TEXT NULL,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
@@ -7384,8 +7385,8 @@ app.post('/api/admin/migrate-balance-columns', async (_req, res) => {
 
     await pool.query(
       `
-      INSERT IGNORE INTO system_telegram_config (singleton_key, bot_token, group_id, welcome_message)
-      VALUES (1, '', '', '')
+      INSERT IGNORE INTO system_telegram_config (singleton_key, bot_token, group_id, welcome_message, private_chat_only_message)
+      VALUES (1, '', '', '', 'Conexão permitida somente no chat privado do bot.')
       `
     )
 
