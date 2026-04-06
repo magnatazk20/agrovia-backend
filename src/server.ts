@@ -7038,6 +7038,20 @@ app.get('/api/admin/users', requireMaxAdmin, async (_req, res) => {
       `
     ).catch(() => null)
 
+    await pool.query(
+      `
+      ALTER TABLE users
+      ADD COLUMN balance DECIMAL(12,2) NOT NULL DEFAULT 0.00
+      `
+    ).catch(() => null)
+
+    await pool.query(
+      `
+      ALTER TABLE users
+      ADD COLUMN referred_by_user_id BIGINT UNSIGNED NULL
+      `
+    ).catch(() => null)
+
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
