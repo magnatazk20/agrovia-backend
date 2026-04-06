@@ -1,5 +1,5 @@
-- [ ] Adicionar coluna `private_link_success_message` em `system_telegram_config` com migração defensiva e fallback
-- [ ] Expor/salvar `privateLinkSuccessMessage` nos endpoints `/api/admin/telegram-config` (GET/POST)
-- [ ] Usar `privateLinkSuccessMessage` no fluxo de sucesso de vinculação no chat privado
-- [ ] Build backend e validação básica
-- [ ] Commit e push backend
+- [x] Validar backend Telegram config (campo private_chat_only_message já persistido em banco e exposto em GET/POST /api/admin/telegram-config)
+- [x] Validar uso da mensagem configurável no polling do bot para mensagens em grupo (chatType !== private)
+- [ ] Reverter alteração indevida feita anteriormente na regra de vínculo de chat Telegram
+- [ ] Executar revisão final de server.ts
+- [ ] Commit e push das alterações no backend
