@@ -5800,6 +5800,132 @@ app.get('/api/site-settings', async (_req, res) => {
   }
 })
 
+app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
+  try {
+    await pool.query(
+      `
+      CREATE TABLE IF NOT EXISTS system_telegram_config (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        bot_token VARCHAR(255) NOT NULL DEFAULT '',
+        group_id VARCHAR(255) NOT NULL DEFAULT '',
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+      )
+      `
+    )
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        bot_token AS botToken,
+        group_id AS groupId,
+        updated_at AS updatedAt
+      FROM system_telegram_config
+      ORDER BY id ASC
+      LIMIT 1
+      `
+    )
+
+    if (rows.length === 0) {
+      res.json({
+        ok: true,
+        config: {
+          botToken: '',
+          groupId: '',
+          updatedAt: null,
+        },
+      })
+      return
+    }
+
+    res.json({
+      ok: true,
+      config: {
+        botToken: String(rows[0].botToken ?? ''),
+        groupId: String(rows[0].groupId ?? ''),
+        updatedAt: rows[0].updatedAt ?? null,
+      },
+    })
+  } catch (err) {
+    console.error('[admin-telegram-config-get]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar configuração do Telegram.' })
+  }
+})
+
+app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
+  const { botToken, groupId } = req.body as {
+    botToken?: string
+    groupId?: string
+  }
+
+  const parsedBotToken = String(botToken ?? '').trim()
+  const parsedGroupId = String(groupId ?? '').trim()
+
+  if (!parsedBotToken) {
+    res.status(400).json({ ok: false, error: 'Bot token é obrigatório.' })
+    return
+  }
+
+  if (!parsedGroupId) {
+    res.status(400).json({ ok: false, error: 'Group ID é obrigatório.' })
+    return
+  }
+
+  try {
+    await pool.query(
+      `
+      CREATE TABLE IF NOT EXISTS system_telegram_config (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        bot_token VARCHAR(255) NOT NULL DEFAULT '',
+        group_id VARCHAR(255) NOT NULL DEFAULT '',
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+      )
+      `
+    )
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT id FROM system_telegram_config ORDER BY id ASC LIMIT 1'
+    )
+
+    if (rows.length === 0) {
+      await pool.query(
+        `
+        INSERT INTO system_telegram_config (bot_token, group_id)
+        VALUES (?, ?)
+        `,
+        [parsedBotToken, parsedGroupId]
+      )
+    } else {
+      await pool.query(
+        `
+        UPDATE system_telegram_config
+        SET
+          bot_token = ?,
+          group_id = ?,
+          updated_at = NOW()
+        WHERE id = ?
+        `,
+        [parsedBotToken, parsedGroupId, Number(rows[0].id)]
+      )
+    }
+
+    res.json({
+      ok: true,
+      message: 'Configuração do Telegram salva com sucesso.',
+      config: {
+        botToken: parsedBotToken,
+        groupId: parsedGroupId,
+      },
+    })
+  } catch (err) {
+    console.error('[admin-telegram-config-save]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao salvar configuração do Telegram.' })
+  }
+})
+
 app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
   try {
     await pool.query(
