@@ -1,5 +1,5 @@
-- [ ] Validar conexão/configuração do banco em `src/db.ts` e variáveis de ambiente usadas pelo backend.
-- [ ] Reforçar criação da tabela `system_telegram_config` no bootstrap do servidor (inicialização), não apenas no endpoint.
-- [ ] Ajustar endpoint GET/POST de Telegram para reutilizar função de garantia de schema.
-- [ ] Testar build/execução do backend para validar a correção.
+- [x] Criar infraestrutura de conexão Telegram no backend (schema + polling + vínculo por telefone).
+- [x] Integrar emissão websocket em tempo real quando conta Telegram for conectada.
+- [x] Adicionar endpoint de status de conexão Telegram por usuário.
+- [x] Executar build e validar funcionamento básico.
 - [ ] Commitar e dar push das alterações.

@@ -28,6 +28,9 @@ const LUMO_API_KEY = 'pk_69aa7a3d1a07dffe750eb533c92fabbe87974479ed791fb7ead328a
 const LUMO_WEBHOOK_SECRET = 'sk_8910b90244b35ab56342bc3c019e569bb59abb9a90a7f69ad1dd59ce59ebd1065dc6240536d0a7b2e69496f8bac1dcdb739d22767183e2421b590f1fbfb77e39';
 const LUMOPAY_TRANSFER_URL = 'https://api.lumopayment.com/api/payments/transfers/pix';
 const SAO_PAULO_TZ = 'America/Sao_Paulo';
+let telegramPollingStarted = false;
+let telegramPollingInterval = null;
+let telegramUpdateOffset = 0;
 const getSaoPauloDateString = () => new Intl.DateTimeFormat('en-CA', {
     timeZone: SAO_PAULO_TZ,
     year: 'numeric',
@@ -145,6 +148,146 @@ const ensureTelegramConfigTable = async () => {
     )
     `);
 };
+const ensureUserTelegramConnectionsTable = async () => {
+    await db_1.default.query(`
+    CREATE TABLE IF NOT EXISTS user_telegram_connections (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id BIGINT UNSIGNED NOT NULL,
+      phone VARCHAR(40) NOT NULL,
+      telegram_chat_id VARCHAR(80) NOT NULL,
+      telegram_user_id VARCHAR(80) NOT NULL,
+      telegram_username VARCHAR(120) NULL,
+      telegram_first_name VARCHAR(120) NULL,
+      is_connected TINYINT(1) NOT NULL DEFAULT 1,
+      connected_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_user_telegram_user_id (user_id),
+      UNIQUE KEY uq_user_telegram_chat_id (telegram_chat_id),
+      KEY idx_user_telegram_phone (phone)
+    )
+    `);
+};
+const normalizePhoneForCompare = (value) => String(value ?? '').replace(/\D/g, '');
+const sendTelegramMessage = async (botToken, chatId, text) => {
+    if (!botToken || !chatId)
+        return;
+    try {
+        await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                chat_id: chatId,
+                text,
+            }),
+        });
+    }
+    catch (err) {
+        console.error('[telegram-send-message]', err);
+    }
+};
+const processTelegramUpdates = async () => {
+    try {
+        await ensureTelegramConfigTable();
+        await ensureUserTelegramConnectionsTable();
+        const [configRows] = await db_1.default.query(`
+      SELECT bot_token AS botToken
+      FROM system_telegram_config
+      WHERE TRIM(bot_token) <> ''
+      ORDER BY id ASC
+      LIMIT 1
+      `);
+        if (configRows.length === 0)
+            return;
+        const botToken = String(configRows[0].botToken ?? '').trim();
+        if (!botToken)
+            return;
+        const updatesUrl = `https://api.telegram.org/bot${botToken}/getUpdates?timeout=25${telegramUpdateOffset > 0 ? `&offset=${telegramUpdateOffset}` : ''}`;
+        const updatesRes = await fetch(updatesUrl);
+        const updatesData = await updatesRes.json();
+        if (!updatesRes.ok || !updatesData?.ok || !Array.isArray(updatesData?.result)) {
+            return;
+        }
+        for (const update of updatesData.result) {
+            const updateId = Number(update?.update_id ?? 0);
+            if (updateId > 0)
+                telegramUpdateOffset = updateId + 1;
+            const message = update?.message;
+            if (!message)
+                continue;
+            const chatId = String(message?.chat?.id ?? '').trim();
+            const telegramUserId = String(message?.from?.id ?? '').trim();
+            const telegramUsername = String(message?.from?.username ?? '').trim() || null;
+            const telegramFirstName = String(message?.from?.first_name ?? '').trim() || null;
+            const textRaw = String(message?.text ?? '').trim();
+            if (!chatId || !telegramUserId || !textRaw)
+                continue;
+            const normalizedIncomingPhone = normalizePhoneForCompare(textRaw);
+            if (!normalizedIncomingPhone) {
+                await sendTelegramMessage(botToken, chatId, 'Envie o telefone cadastrado na plataforma para conectar sua conta.');
+                continue;
+            }
+            const [userRows] = await db_1.default.query(`
+        SELECT id, phone
+        FROM users
+        WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = ?
+        LIMIT 1
+        `, [normalizedIncomingPhone]);
+            if (userRows.length === 0) {
+                await sendTelegramMessage(botToken, chatId, 'Telefone não encontrado. Envie o telefone exatamente como cadastrado.');
+                continue;
+            }
+            const userId = Number(userRows[0].id);
+            const phone = String(userRows[0].phone ?? '');
+            await db_1.default.query(`
+        INSERT INTO user_telegram_connections
+        (
+          user_id,
+          phone,
+          telegram_chat_id,
+          telegram_user_id,
+          telegram_username,
+          telegram_first_name,
+          is_connected,
+          connected_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 1, NOW())
+        ON DUPLICATE KEY UPDATE
+          phone = VALUES(phone),
+          telegram_chat_id = VALUES(telegram_chat_id),
+          telegram_user_id = VALUES(telegram_user_id),
+          telegram_username = VALUES(telegram_username),
+          telegram_first_name = VALUES(telegram_first_name),
+          is_connected = 1,
+          connected_at = NOW(),
+          updated_at = NOW()
+        `, [userId, phone, chatId, telegramUserId, telegramUsername, telegramFirstName]);
+            io.to(`user:${userId}`).emit('telegram:connected', {
+                ok: true,
+                userId,
+                phone,
+                telegramChatId: chatId,
+                telegramUserId,
+                connectedAt: new Date().toISOString(),
+            });
+            await sendTelegramMessage(botToken, chatId, 'Conta conectada com sucesso.');
+        }
+    }
+    catch (err) {
+        console.error('[telegram-polling]', err);
+    }
+};
+const startTelegramPolling = () => {
+    if (telegramPollingStarted)
+        return;
+    telegramPollingStarted = true;
+    processTelegramUpdates().catch(() => null);
+    telegramPollingInterval = setInterval(() => {
+        processTelegramUpdates().catch(() => null);
+    }, 5000);
+};
 const requireAuth = async (req, res, next) => {
     const authUser = await resolveAuthUser(req);
     if (!authUser) {
@@ -228,10 +371,12 @@ app.use((0, cors_1.default)());
 app.use(express_1.default.json());
 const bootstrapDatabase = async () => {
     await ensureTelegramConfigTable();
+    await ensureUserTelegramConnectionsTable();
 };
 bootstrapDatabase().catch((err) => {
     console.error('[bootstrap-database]', err);
 });
+startTelegramPolling();
 // ─── Health check ────────────────────────────────────────────────────────────
 app.get('/api/health', async (_req, res) => {
     try {
@@ -4600,6 +4745,61 @@ app.get('/api/site-settings', async (_req, res) => {
         res.status(500).json({ ok: false, error: 'Erro ao carregar configurações públicas do site.' });
     }
 });
+app.get('/api/telegram/connection-status/:userId', requireAuth, async (req, res) => {
+    const userId = Number(req.params.userId);
+    if (!userId || Number.isNaN(userId)) {
+        res.status(400).json({ ok: false, error: 'ID de usuário inválido.' });
+        return;
+    }
+    if (Number(req.authUser?.id ?? 0) !== userId && !Boolean(req.authUser?.isAdmin)) {
+        res.status(403).json({ ok: false, error: 'Acesso negado.' });
+        return;
+    }
+    try {
+        await ensureUserTelegramConnectionsTable();
+        const [rows] = await db_1.default.query(`
+      SELECT
+        user_id AS userId,
+        phone,
+        telegram_chat_id AS telegramChatId,
+        telegram_user_id AS telegramUserId,
+        telegram_username AS telegramUsername,
+        telegram_first_name AS telegramFirstName,
+        is_connected AS isConnected,
+        connected_at AS connectedAt,
+        updated_at AS updatedAt
+      FROM user_telegram_connections
+      WHERE user_id = ?
+      LIMIT 1
+      `, [userId]);
+        if (rows.length === 0) {
+            res.json({
+                ok: true,
+                connected: false,
+                connection: null,
+            });
+            return;
+        }
+        res.json({
+            ok: true,
+            connected: Number(rows[0].isConnected ?? 0) === 1,
+            connection: {
+                userId: Number(rows[0].userId),
+                phone: String(rows[0].phone ?? ''),
+                telegramChatId: String(rows[0].telegramChatId ?? ''),
+                telegramUserId: String(rows[0].telegramUserId ?? ''),
+                telegramUsername: rows[0].telegramUsername ? String(rows[0].telegramUsername) : null,
+                telegramFirstName: rows[0].telegramFirstName ? String(rows[0].telegramFirstName) : null,
+                connectedAt: rows[0].connectedAt ?? null,
+                updatedAt: rows[0].updatedAt ?? null,
+            },
+        });
+    }
+    catch (err) {
+        console.error('[telegram-connection-status]', err);
+        res.status(500).json({ ok: false, error: 'Erro ao carregar status de conexão do Telegram.' });
+    }
+});
 app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
     try {
         await ensureTelegramConfigTable();
@@ -6352,6 +6552,12 @@ app.use((req, _res, next) => {
 });
 io.on('connection', (socket) => {
     console.log(`[ws] client connected: ${socket.id}`);
+    socket.on('telegram:subscribe', (payload) => {
+        const userId = Number(payload?.userId ?? 0);
+        if (!userId || Number.isNaN(userId))
+            return;
+        socket.join(`user:${userId}`);
+    });
     socket.on('disconnect', () => {
         console.log(`[ws] client disconnected: ${socket.id}`);
     });
