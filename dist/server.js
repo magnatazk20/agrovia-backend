@@ -281,6 +281,11 @@ const ensureTelegramConfigTable = async () => {
     SET private_link_success_message = 'Conta conectada com sucesso.'
     WHERE private_link_success_message IS NULL OR TRIM(private_link_success_message) = ''
     `);
+    await db_1.default.query(`
+    UPDATE system_telegram_config
+    SET duplicate_connection_message = 'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.'
+    WHERE duplicate_connection_message IS NULL OR TRIM(duplicate_connection_message) = ''
+    `);
 };
 const ensureUserTelegramConnectionsTable = async () => {
     await db_1.default.query(`
@@ -371,7 +376,8 @@ const processTelegramUpdates = async () => {
         group_id AS groupId,
         welcome_message AS welcomeMessage,
         private_chat_only_message AS privateChatOnlyMessage,
-        private_link_success_message AS privateLinkSuccessMessage
+        private_link_success_message AS privateLinkSuccessMessage,
+        duplicate_connection_message AS duplicateConnectionMessage
       FROM system_telegram_config
       WHERE TRIM(bot_token) <> ''
       ORDER BY id ASC
@@ -385,6 +391,8 @@ const processTelegramUpdates = async () => {
         const privateChatOnlyMessage = String(configRows[0].privateChatOnlyMessage ?? '').trim() ||
             'Conexão permitida somente no chat privado do bot.';
         const privateLinkSuccessMessage = String(configRows[0].privateLinkSuccessMessage ?? '').trim() || 'Conta conectada com sucesso.';
+        const duplicateConnectionMessage = String(configRows[0].duplicateConnectionMessage ?? '').trim() ||
+            'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.';
         if (!botToken)
             return;
         const updatesUrl = `https://api.telegram.org/bot${botToken}/getUpdates?timeout=25${telegramUpdateOffset > 0 ? `&offset=${telegramUpdateOffset}` : ''}`;
@@ -465,7 +473,7 @@ const processTelegramUpdates = async () => {
         LIMIT 1
         `, [chatId, telegramUserId]);
             if (existingByChatOrTelegramUserRows.length > 0) {
-                await sendTelegramMessage(botToken, chatId, 'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.');
+                await sendTelegramMessage(botToken, chatId, duplicateConnectionMessage);
                 continue;
             }
             const [existingByPhoneRows] = await db_1.default.query(`
@@ -482,7 +490,7 @@ const processTelegramUpdates = async () => {
           WHERE id = ?
              OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = ?
           `, [userId, normalizedIncomingPhone]);
-                await sendTelegramMessage(botToken, chatId, 'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.');
+                await sendTelegramMessage(botToken, chatId, duplicateConnectionMessage);
                 continue;
             }
             const conn = await db_1.default.getConnection();
@@ -502,7 +510,7 @@ const processTelegramUpdates = async () => {
             WHERE id = ?
             `, [userId]);
                     await conn.commit();
-                    await sendTelegramMessage(botToken, chatId, 'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.');
+                    await sendTelegramMessage(botToken, chatId, duplicateConnectionMessage);
                     continue;
                 }
                 await conn.query(`
@@ -5209,6 +5217,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
         welcome_message AS welcomeMessage,
         private_chat_only_message AS privateChatOnlyMessage,
         private_link_success_message AS privateLinkSuccessMessage,
+        duplicate_connection_message AS alreadyLinkedMessage,
         updated_at AS updatedAt
       FROM system_telegram_config
       ORDER BY id ASC
@@ -5223,6 +5232,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
                     welcomeMessage: '',
                     privateChatOnlyMessage: 'Conexão permitida somente no chat privado do bot.',
                     privateLinkSuccessMessage: 'Conta conectada com sucesso.',
+                    alreadyLinkedMessage: 'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.',
                     updatedAt: null,
                 },
             });
@@ -5237,6 +5247,8 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
                 privateChatOnlyMessage: String(rows[0].privateChatOnlyMessage ?? '').trim() ||
                     'Conexão permitida somente no chat privado do bot.',
                 privateLinkSuccessMessage: String(rows[0].privateLinkSuccessMessage ?? '').trim() || 'Conta conectada com sucesso.',
+                alreadyLinkedMessage: String(rows[0].alreadyLinkedMessage ?? '').trim() ||
+                    'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.',
                 updatedAt: rows[0].updatedAt ?? null,
             },
         });
@@ -5247,13 +5259,15 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
     }
 });
 app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
-    const { botToken, groupId, welcomeMessage, privateChatOnlyMessage, privateLinkSuccessMessage } = req.body;
+    const { botToken, groupId, welcomeMessage, privateChatOnlyMessage, privateLinkSuccessMessage, alreadyLinkedMessage } = req.body;
     const parsedBotToken = String(botToken ?? '').trim();
     const parsedGroupId = String(groupId ?? '').trim();
     const parsedWelcomeMessage = String(welcomeMessage ?? '').trim();
     const parsedPrivateChatOnlyMessage = String(privateChatOnlyMessage ?? '').trim() ||
         'Conexão permitida somente no chat privado do bot.';
     const parsedPrivateLinkSuccessMessage = String(privateLinkSuccessMessage ?? '').trim() || 'Conta conectada com sucesso.';
+    const parsedAlreadyLinkedMessage = String(alreadyLinkedMessage ?? '').trim() ||
+        'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.';
     if (!parsedBotToken) {
         res.status(400).json({ ok: false, error: 'Bot token é obrigatório.' });
         return;
@@ -5271,15 +5285,17 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
         group_id,
         welcome_message,
         private_chat_only_message,
-        private_link_success_message
+        private_link_success_message,
+        duplicate_connection_message
       )
-      VALUES (1, ?, ?, ?, ?, ?)
+      VALUES (1, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         bot_token = VALUES(bot_token),
         group_id = VALUES(group_id),
         welcome_message = VALUES(welcome_message),
         private_chat_only_message = VALUES(private_chat_only_message),
         private_link_success_message = VALUES(private_link_success_message),
+        duplicate_connection_message = VALUES(duplicate_connection_message),
         updated_at = NOW()
       `, [
             parsedBotToken,
@@ -5287,6 +5303,7 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
             parsedWelcomeMessage,
             parsedPrivateChatOnlyMessage,
             parsedPrivateLinkSuccessMessage,
+            parsedAlreadyLinkedMessage,
         ]);
         res.json({
             ok: true,
@@ -5297,6 +5314,7 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
                 welcomeMessage: parsedWelcomeMessage,
                 privateChatOnlyMessage: parsedPrivateChatOnlyMessage,
                 privateLinkSuccessMessage: parsedPrivateLinkSuccessMessage,
+                alreadyLinkedMessage: parsedAlreadyLinkedMessage,
             },
         });
     }
