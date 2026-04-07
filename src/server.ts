@@ -631,28 +631,50 @@ const processTelegramUpdates = async () => {
       const textLower = textRaw.toLowerCase()
       const sanitizeGroupId = (value: string) =>
         String(value ?? '').replace(/[^\d-]/g, '').replace(/^-+/, '-').trim()
+      const onlyDigits = (value: string) => String(value ?? '').replace(/\D/g, '').trim()
+      const trimTelegram100Prefix = (value: string) => String(value ?? '').replace(/^-100/, '').trim()
+
       const configuredGroupIdSanitized = sanitizeGroupId(configuredGroupId)
       const chatIdSanitized = sanitizeGroupId(chatId)
-      const normalizedConfiguredGroupId = configuredGroupIdSanitized.replace(/^-100/, '').trim()
-      const normalizedChatId = chatIdSanitized.replace(/^-100/, '').trim()
+
+      const configuredNo100 = trimTelegram100Prefix(configuredGroupIdSanitized)
+      const chatNo100 = trimTelegram100Prefix(chatIdSanitized)
+
+      const configuredDigits = onlyDigits(configuredGroupIdSanitized)
+      const chatDigits = onlyDigits(chatIdSanitized)
+
+      const configuredDigitsNo100 = configuredDigits.startsWith('100')
+        ? configuredDigits.slice(3)
+        : configuredDigits
+      const chatDigitsNo100 = chatDigits.startsWith('100')
+        ? chatDigits.slice(3)
+        : chatDigits
+
       if (!chatIdSanitized || !telegramUserId) continue
 
       const isGroupMessage = chatType === 'group' || chatType === 'supergroup'
       const hasConfiguredGroup = Boolean(configuredGroupIdSanitized)
+
       const isConfiguredGroupMessage =
         hasConfiguredGroup &&
         (
           chatIdSanitized === configuredGroupIdSanitized ||
-          normalizedChatId === normalizedConfiguredGroupId
+          chatNo100 === configuredNo100 ||
+          chatDigits === configuredDigits ||
+          chatDigitsNo100 === configuredDigitsNo100
         )
 
       console.info('[telegram-group-match]', {
         chatId,
         chatIdSanitized,
+        chatNo100,
+        chatDigits,
+        chatDigitsNo100,
         configuredGroupId,
         configuredGroupIdSanitized,
-        normalizedChatId,
-        normalizedConfiguredGroupId,
+        configuredNo100,
+        configuredDigits,
+        configuredDigitsNo100,
         chatType,
         isGroupMessage,
         isConfiguredGroupMessage,
