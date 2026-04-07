@@ -197,6 +197,8 @@ const ensureTelegramConfigTable = async () => {
       welcome_message TEXT NULL,
         private_chat_only_message TEXT NULL,
         private_link_success_message TEXT NULL,
+        checkin_success_message TEXT NULL,
+        checkin_already_claimed_message TEXT NULL,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
@@ -253,6 +255,24 @@ const ensureTelegramConfigTable = async () => {
     catch {
         // coluna já existe
     }
+    try {
+        await db_1.default.query(`
+      ALTER TABLE system_telegram_config
+      ADD COLUMN checkin_success_message TEXT NULL
+      `);
+    }
+    catch {
+        // coluna já existe
+    }
+    try {
+        await db_1.default.query(`
+      ALTER TABLE system_telegram_config
+      ADD COLUMN checkin_already_claimed_message TEXT NULL
+      `);
+    }
+    catch {
+        // coluna já existe
+    }
     await db_1.default.query(`
     INSERT IGNORE INTO system_telegram_config (
       singleton_key,
@@ -285,6 +305,16 @@ const ensureTelegramConfigTable = async () => {
     UPDATE system_telegram_config
     SET duplicate_connection_message = 'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.'
     WHERE duplicate_connection_message IS NULL OR TRIM(duplicate_connection_message) = ''
+    `);
+    await db_1.default.query(`
+    UPDATE system_telegram_config
+    SET checkin_success_message = 'Check-in do dia {day} resgatado com sucesso!'
+    WHERE checkin_success_message IS NULL OR TRIM(checkin_success_message) = ''
+    `);
+    await db_1.default.query(`
+    UPDATE system_telegram_config
+    SET checkin_already_claimed_message = 'Check-in de hoje já foi resgatado.'
+    WHERE checkin_already_claimed_message IS NULL OR TRIM(checkin_already_claimed_message) = ''
     `);
 };
 const ensureUserTelegramConnectionsTable = async () => {
@@ -507,7 +537,9 @@ const processTelegramUpdates = async () => {
         welcome_message AS welcomeMessage,
         private_chat_only_message AS privateChatOnlyMessage,
         private_link_success_message AS privateLinkSuccessMessage,
-        duplicate_connection_message AS duplicateConnectionMessage
+        duplicate_connection_message AS duplicateConnectionMessage,
+        checkin_success_message AS checkinSuccessMessage,
+        checkin_already_claimed_message AS checkinAlreadyClaimedMessage
       FROM system_telegram_config
       WHERE TRIM(bot_token) <> ''
       ORDER BY id ASC
@@ -523,6 +555,10 @@ const processTelegramUpdates = async () => {
         const privateLinkSuccessMessage = String(configRows[0].privateLinkSuccessMessage ?? '').trim() || 'Conta conectada com sucesso.';
         const duplicateConnectionMessage = String(configRows[0].duplicateConnectionMessage ?? '').trim() ||
             'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.';
+        const configuredCheckinSuccessMessage = String(configRows[0].checkinSuccessMessage ?? '').trim() ||
+            'Check-in do dia {day} resgatado com sucesso!';
+        const configuredCheckinAlreadyClaimedMessage = String(configRows[0].checkinAlreadyClaimedMessage ?? '').trim() ||
+            'Check-in de hoje já foi resgatado.';
         if (!botToken)
             return;
         const updatesUrl = `https://api.telegram.org/bot${botToken}/getUpdates?timeout=25${telegramUpdateOffset > 0 ? `&offset=${telegramUpdateOffset}` : ''}`;
@@ -628,9 +664,14 @@ const processTelegramUpdates = async () => {
                 }
                 const linkedUserId = Number(connectionRows[0].userId ?? 0);
                 const claimResult = await claimCheckinForUser(linkedUserId);
-                await sendTelegramMessage(botToken, chatId, claimResult.ok
-                    ? String(claimResult.message ?? '✅ Check-in realizado com sucesso!')
-                    : String(claimResult.error ?? 'Não foi possível processar seu check-in.'));
+                const checkinDay = Number(claimResult?.claim?.day ?? 0);
+                const successMessage = configuredCheckinSuccessMessage.replace('{day}', String(checkinDay));
+                const alreadyClaimed = !claimResult.ok &&
+                    String(claimResult?.error ?? '').trim().toLowerCase() === 'check-in de hoje já foi resgatado.';
+                const errorMessage = alreadyClaimed
+                    ? configuredCheckinAlreadyClaimedMessage
+                    : String(claimResult.error ?? 'Não foi possível processar seu check-in.');
+                await sendTelegramMessage(botToken, chatId, claimResult.ok ? successMessage : errorMessage);
                 continue;
             }
             if (chatType !== 'private') {
@@ -5419,6 +5460,8 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
         private_chat_only_message AS privateChatOnlyMessage,
         private_link_success_message AS privateLinkSuccessMessage,
         duplicate_connection_message AS alreadyLinkedMessage,
+        checkin_success_message AS checkinSuccessMessage,
+        checkin_already_claimed_message AS checkinAlreadyClaimedMessage,
         updated_at AS updatedAt
       FROM system_telegram_config
       ORDER BY id ASC
@@ -5434,6 +5477,8 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
                     privateChatOnlyMessage: 'Conexão permitida somente no chat privado do bot.',
                     privateLinkSuccessMessage: 'Conta conectada com sucesso.',
                     alreadyLinkedMessage: 'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.',
+                    checkinSuccessMessage: 'Check-in do dia {day} resgatado com sucesso!',
+                    checkinAlreadyClaimedMessage: 'Check-in de hoje já foi resgatado.',
                     updatedAt: null,
                 },
             });
@@ -5450,6 +5495,8 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
                 privateLinkSuccessMessage: String(rows[0].privateLinkSuccessMessage ?? '').trim() || 'Conta conectada com sucesso.',
                 alreadyLinkedMessage: String(rows[0].alreadyLinkedMessage ?? '').trim() ||
                     'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.',
+                checkinSuccessMessage: String(rows[0].checkinSuccessMessage ?? '').trim() || 'Check-in do dia {day} resgatado com sucesso!',
+                checkinAlreadyClaimedMessage: String(rows[0].checkinAlreadyClaimedMessage ?? '').trim() || 'Check-in de hoje já foi resgatado.',
                 updatedAt: rows[0].updatedAt ?? null,
             },
         });
@@ -5460,7 +5507,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
     }
 });
 app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
-    const { botToken, groupId, welcomeMessage, privateChatOnlyMessage, privateLinkSuccessMessage, alreadyLinkedMessage } = req.body;
+    const { botToken, groupId, welcomeMessage, privateChatOnlyMessage, privateLinkSuccessMessage, alreadyLinkedMessage, checkinSuccessMessage, checkinAlreadyClaimedMessage, } = req.body;
     const parsedBotToken = String(botToken ?? '').trim();
     const parsedGroupId = String(groupId ?? '').trim();
     const parsedWelcomeMessage = String(welcomeMessage ?? '').trim();
@@ -5469,6 +5516,10 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
     const parsedPrivateLinkSuccessMessage = String(privateLinkSuccessMessage ?? '').trim() || 'Conta conectada com sucesso.';
     const parsedAlreadyLinkedMessage = String(alreadyLinkedMessage ?? '').trim() ||
         'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.';
+    const parsedCheckinSuccessMessage = String(checkinSuccessMessage ?? '').trim() ||
+        'Check-in do dia {day} resgatado com sucesso!';
+    const parsedCheckinAlreadyClaimedMessage = String(checkinAlreadyClaimedMessage ?? '').trim() ||
+        'Check-in de hoje já foi resgatado.';
     if (!parsedBotToken) {
         res.status(400).json({ ok: false, error: 'Bot token é obrigatório.' });
         return;
@@ -5487,9 +5538,11 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
         welcome_message,
         private_chat_only_message,
         private_link_success_message,
-        duplicate_connection_message
+        duplicate_connection_message,
+        checkin_success_message,
+        checkin_already_claimed_message
       )
-      VALUES (1, ?, ?, ?, ?, ?, ?)
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         bot_token = VALUES(bot_token),
         group_id = VALUES(group_id),
@@ -5497,6 +5550,8 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
         private_chat_only_message = VALUES(private_chat_only_message),
         private_link_success_message = VALUES(private_link_success_message),
         duplicate_connection_message = VALUES(duplicate_connection_message),
+        checkin_success_message = VALUES(checkin_success_message),
+        checkin_already_claimed_message = VALUES(checkin_already_claimed_message),
         updated_at = NOW()
       `, [
             parsedBotToken,
@@ -5505,6 +5560,8 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
             parsedPrivateChatOnlyMessage,
             parsedPrivateLinkSuccessMessage,
             parsedAlreadyLinkedMessage,
+            parsedCheckinSuccessMessage,
+            parsedCheckinAlreadyClaimedMessage,
         ]);
         res.json({
             ok: true,
@@ -5516,6 +5573,8 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
                 privateChatOnlyMessage: parsedPrivateChatOnlyMessage,
                 privateLinkSuccessMessage: parsedPrivateLinkSuccessMessage,
                 alreadyLinkedMessage: parsedAlreadyLinkedMessage,
+                checkinSuccessMessage: parsedCheckinSuccessMessage,
+                checkinAlreadyClaimedMessage: parsedCheckinAlreadyClaimedMessage,
             },
         });
     }
