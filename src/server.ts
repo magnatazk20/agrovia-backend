@@ -703,6 +703,15 @@ const processTelegramUpdates = async () => {
           continue
         }
 
+        console.info('[telegram-checkin-command]', {
+          configuredGroupId,
+          configuredGroupIdSanitized,
+          chatId,
+          chatIdSanitized,
+          telegramUserId,
+          isConfiguredGroupMessage,
+        })
+
         const [connectionRows] = await pool.query<RowDataPacket[]>(
           `
           SELECT user_id AS userId
@@ -731,7 +740,7 @@ const processTelegramUpdates = async () => {
           botToken,
           chatId,
           claimResult.ok
-            ? '✅ Check-in realizado com sucesso! Você recebeu R$ 1,00.'
+            ? String(claimResult.message ?? '✅ Check-in realizado com sucesso!')
             : String(claimResult.error ?? 'Não foi possível processar seu check-in.')
         )
         continue
