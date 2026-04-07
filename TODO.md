@@ -1,4 +1,5 @@
-- [ ] Ajustar normalização/comparação do group_id para responder /checkin exatamente no grupo configurado
-- [ ] Adicionar logs de diagnóstico no fluxo de updates do Telegram
-- [ ] Validar build TypeScript
-- [ ] Commit e push das mudanças
+# TODO - Hotfix backend build (db.ts)
+
+- [x] Corrigir `src/db.ts` (pool MySQL + exports DB_* válidos)
+- [x] Rodar `npm run build` no backend
+- [ ] Commit e push da correção
