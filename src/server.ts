@@ -656,6 +656,7 @@ const processTelegramUpdates = async () => {
       const hasConfiguredGroup = Boolean(configuredGroupIdSanitized)
 
       const isConfiguredGroupMessage =
+        isGroupMessage &&
         hasConfiguredGroup &&
         (
           chatIdSanitized === configuredGroupIdSanitized ||
