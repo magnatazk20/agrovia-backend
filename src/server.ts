@@ -355,7 +355,11 @@ const ensureTelegramConnectedSync = async () => {
         SELECT DISTINCT REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') AS normalized_phone
         FROM user_telegram_connections
         WHERE phone IS NOT NULL AND TRIM(phone) <> ''
-      ) t ON REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(u.phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = t.normalized_phone
+      ) t ON (
+        CONVERT(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(u.phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') USING utf8mb4) COLLATE utf8mb4_unicode_ci
+        =
+        CONVERT(t.normalized_phone USING utf8mb4) COLLATE utf8mb4_unicode_ci
+      )
       SET u.telegram_conectado = 1
       `
     )
