@@ -662,8 +662,10 @@ const processTelegramUpdates = async () => {
           `, [telegramUserId]);
                 if (connectionRows.length === 0) {
                     const usernameValue = telegramUsername ? `@${telegramUsername}` : '@usuário';
-                    const botUsername = String(updatesData?.result?.[0]?.message?.via_bot?.username ?? '').trim();
-                    const botButtonLabel = botUsername ? `@${botUsername}` : 'Abrir bot';
+                    const meRes = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
+                    const meData = await meRes.json().catch(() => null);
+                    const botUsername = String(meData?.result?.username ?? '').trim();
+                    const botButtonLabel = botUsername ? `@${botUsername}` : 'Vincular conta';
                     const botUrl = botUsername ? `https://t.me/${botUsername}` : undefined;
                     await sendTelegramMessage(botToken, chatId, `⚠️ Lembrete ${usernameValue} Você ainda não vinculou sua conta PGLM e não pode receber recompensas de check-in! Clique no botão abaixo para vincular`, botUrl
                         ? {

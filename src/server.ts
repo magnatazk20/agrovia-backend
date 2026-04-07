@@ -785,8 +785,10 @@ const processTelegramUpdates = async () => {
 
         if (connectionRows.length === 0) {
           const usernameValue = telegramUsername ? `@${telegramUsername}` : '@usuário'
-          const botUsername = String((updatesData as any)?.result?.[0]?.message?.via_bot?.username ?? '').trim()
-          const botButtonLabel = botUsername ? `@${botUsername}` : 'Abrir bot'
+          const meRes = await fetch(`https://api.telegram.org/bot${botToken}/getMe`)
+          const meData = await meRes.json().catch(() => null) as any
+          const botUsername = String(meData?.result?.username ?? '').trim()
+          const botButtonLabel = botUsername ? `@${botUsername}` : 'Vincular conta'
           const botUrl = botUsername ? `https://t.me/${botUsername}` : undefined
 
           await sendTelegramMessage(
