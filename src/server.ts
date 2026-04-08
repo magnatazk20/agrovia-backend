@@ -6086,6 +6086,68 @@ app.post('/api/gift-codes/redeem', async (req, res) => {
   }
 })
 
+app.get('/api/referral/commission-levels/debug', async (req, res) => {
+  const debugRequestInfo = {
+    method: req.method,
+    originalUrl: req.originalUrl,
+    path: req.path,
+    query: req.query,
+    params: req.params,
+    ip: req.ip,
+    forwardedFor: req.headers['x-forwarded-for'],
+    userAgent: req.headers['user-agent'],
+  }
+
+  try {
+    await ensureCommissionLevelsTable()
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        id,
+        level,
+        name,
+        commission_percent AS commissionPercent,
+        is_active AS isActive,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+      FROM commission_levels
+      ORDER BY level ASC, id ASC
+      `
+    )
+
+    res.json({
+      ok: true,
+      debug: true,
+      database: {
+        dbName: DB_NAME,
+        dbHost: DB_HOST,
+        dbPort: DB_PORT,
+      },
+      request: debugRequestInfo,
+      totalLevels: rows.length,
+      rawLevels: rows,
+    })
+  } catch (err) {
+    console.error('[referral-commission-levels-debug-get]', {
+      error: err,
+      request: debugRequestInfo,
+      dbName: DB_NAME,
+      dbHost: DB_HOST,
+      dbPort: DB_PORT,
+    })
+    res.status(500).json({
+      ok: false,
+      error: 'Erro ao carregar debug dos níveis de comissão.',
+      database: {
+        dbName: DB_NAME,
+        dbHost: DB_HOST,
+        dbPort: DB_PORT,
+      },
+    })
+  }
+})
+
 app.get('/api/referral/commission-levels', async (req, res) => {
   const debugRequestInfo = {
     method: req.method,
