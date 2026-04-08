@@ -5163,7 +5163,9 @@ app.post('/api/withdraw/request', async (req, res) => {
 
     const [configRows] = await conn.query<RowDataPacket[]>(
       `
-      SELECT withdraw_auto_approve AS withdrawAutoApprove
+      SELECT
+        withdraw_auto_approve AS withdrawAutoApprove,
+        withdraw_fee_percent AS withdrawFeePercent
       FROM system_withdraw_config
       ORDER BY id ASC
       LIMIT 1
@@ -5171,6 +5173,24 @@ app.post('/api/withdraw/request', async (req, res) => {
     )
 
     const shouldAutoApprove = Number(configRows[0]?.withdrawAutoApprove ?? 0) === 1
+    const withdrawFeePercentRaw = Number(configRows[0]?.withdrawFeePercent ?? 0)
+    const withdrawFeePercent = Number.isFinite(withdrawFeePercentRaw)
+      ? Math.max(0, withdrawFeePercentRaw)
+      : 0
+
+    const feeAmount = Number((parsedAmount * (withdrawFeePercent / 100)).toFixed(2))
+    const netAmount = Number((parsedAmount - feeAmount).toFixed(2))
+
+    if (!Number.isFinite(netAmount) || netAmount <= 0) {
+      await conn.rollback()
+      res.status(400).json({
+        ok: false,
+        error: 'Valor líquido do saque inválido após taxa configurada.',
+        requestedAmount: Number(parsedAmount.toFixed(2)),
+        feePercent: withdrawFeePercent,
+      })
+      return
+    }
 
     const oldBalance = Number(currentBalance.toFixed(2))
     const newBalance = Number((oldBalance - parsedAmount).toFixed(2))
@@ -5194,7 +5214,7 @@ app.post('/api/withdraw/request', async (req, res) => {
       const lumopayPixKey = normalizeLumopayPixKey(pixKey, lumopayPixType)
 
       const cashoutPayload = {
-        amount: Number(parsedAmount.toFixed(2)),
+        amount: netAmount,
         pixKey: lumopayPixKey,
         pixKeyType: lumopayPixType,
         description: `Saque PIX auto #${externalId}`,
@@ -5300,6 +5320,10 @@ app.post('/api/withdraw/request', async (req, res) => {
           autoApprove: shouldAutoApprove,
           providerTransactionId,
           activationTokenId,
+          requestedAmount: Number(parsedAmount.toFixed(2)),
+          feePercent: withdrawFeePercent,
+          feeAmount,
+          netAmount,
         }),
       ]
     )
@@ -5314,6 +5338,9 @@ app.post('/api/withdraw/request', async (req, res) => {
       withdraw: {
         id: Number(insertResult?.insertId ?? 0),
         amount: Number(parsedAmount.toFixed(2)),
+        feePercent: withdrawFeePercent,
+        feeAmount,
+        netAmount,
         status: withdrawStatus,
         transactionId: providerTransactionId,
         externalId,
