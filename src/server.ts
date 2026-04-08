@@ -418,6 +418,61 @@ const ensureTelegramConnectedSync = async () => {
 
 const normalizePhoneForCompare = (value: string) => String(value ?? '').replace(/\D/g, '')
 
+const ensureWithdrawActivationTokensTable = async () => {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS withdraw_activation_tokens (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id BIGINT UNSIGNED NOT NULL,
+      token VARCHAR(64) NOT NULL,
+      status ENUM('pending','activated','expired') NOT NULL DEFAULT 'pending',
+      telegram_user_id VARCHAR(80) NULL,
+      activated_chat_id VARCHAR(80) NULL,
+      activated_at DATETIME NULL,
+      expires_at DATETIME NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_withdraw_activation_tokens_token (token),
+      KEY idx_withdraw_activation_tokens_user (user_id),
+      KEY idx_withdraw_activation_tokens_status (status),
+      KEY idx_withdraw_activation_tokens_expires_at (expires_at)
+    )
+    `
+  )
+}
+
+const createWithdrawActivationToken = async (userId: number) => {
+  const parsedUserId = Number(userId)
+  if (!parsedUserId || Number.isNaN(parsedUserId)) {
+    throw new Error('ID de usuário inválido para gerar token.')
+  }
+
+  await ensureWithdrawActivationTokensTable()
+
+  const token = crypto.randomBytes(8).toString('hex').slice(0, 16)
+  await pool.query(
+    `
+    UPDATE withdraw_activation_tokens
+    SET status = 'expired', updated_at = NOW()
+    WHERE user_id = ?
+      AND status = 'pending'
+    `,
+    [parsedUserId]
+  )
+
+  await pool.query(
+    `
+    INSERT INTO withdraw_activation_tokens
+    (user_id, token, status, expires_at)
+    VALUES (?, ?, 'pending', DATE_ADD(NOW(), INTERVAL 30 MINUTE))
+    `,
+    [parsedUserId, token]
+  )
+
+  return token
+}
+
 const sendTelegramMessage = async (
   botToken: string,
   chatId: string,
@@ -757,6 +812,97 @@ const processTelegramUpdates = async () => {
         const isCheckinCommand =
           normalizedCommandText === '/checkin' ||
           normalizedCommandText.startsWith('/checkin@')
+
+        const activationMatch = textRaw.match(/^Ative o saque para mim:\s*([a-z0-9]{16})$/i)
+        if (activationMatch) {
+          const tokenCandidate = String(activationMatch[1] ?? '').trim().toLowerCase()
+
+          await ensureWithdrawActivationTokensTable()
+
+          const [tokenRows] = await pool.query<RowDataPacket[]>(
+            `
+            SELECT
+              id,
+              user_id AS userId,
+              status,
+              expires_at AS expiresAt
+            FROM withdraw_activation_tokens
+            WHERE token = ?
+            LIMIT 1
+            FOR UPDATE
+            `,
+            [tokenCandidate]
+          )
+
+          if (tokenRows.length === 0) {
+            await sendTelegramMessage(botToken, chatId, 'Token de ativação inválido.')
+            continue
+          }
+
+          const tokenRow = tokenRows[0]
+          const tokenId = Number(tokenRow.id ?? 0)
+          const tokenUserId = Number(tokenRow.userId ?? 0)
+          const tokenStatus = String(tokenRow.status ?? 'pending').toLowerCase()
+          const expiresAt = tokenRow.expiresAt ? new Date(tokenRow.expiresAt) : null
+
+          if (tokenStatus !== 'pending') {
+            await sendTelegramMessage(botToken, chatId, 'Este token já foi utilizado ou expirou.')
+            continue
+          }
+
+          if (!expiresAt || expiresAt.getTime() < Date.now()) {
+            await pool.query(
+              `
+              UPDATE withdraw_activation_tokens
+              SET status = 'expired', updated_at = NOW()
+              WHERE id = ?
+              `,
+              [tokenId]
+            )
+            await sendTelegramMessage(botToken, chatId, 'Token expirado. Gere um novo token no app.')
+            continue
+          }
+
+          const [connectionRows] = await pool.query<RowDataPacket[]>(
+            `
+            SELECT user_id AS userId
+            FROM user_telegram_connections
+            WHERE telegram_user_id = ?
+              AND COALESCE(is_connected, 1) = 1
+            ORDER BY id DESC
+            LIMIT 1
+            `,
+            [telegramUserId]
+          )
+
+          if (connectionRows.length === 0) {
+            await sendTelegramMessage(botToken, chatId, 'Você precisa vincular sua conta primeiro no privado do bot.')
+            continue
+          }
+
+          const linkedUserId = Number(connectionRows[0].userId ?? 0)
+          if (linkedUserId !== tokenUserId) {
+            await sendTelegramMessage(botToken, chatId, 'Este token não pertence à sua conta.')
+            continue
+          }
+
+          await pool.query(
+            `
+            UPDATE withdraw_activation_tokens
+            SET
+              status = 'activated',
+              telegram_user_id = ?,
+              activated_chat_id = ?,
+              activated_at = NOW(),
+              updated_at = NOW()
+            WHERE id = ?
+            `,
+            [telegramUserId, chatId, tokenId]
+          )
+
+          await sendTelegramMessage(botToken, chatId, '✅ Saque ativado com sucesso para sua conta.')
+          continue
+        }
 
         if (!isCheckinCommand) {
           continue
@@ -1339,8 +1485,10 @@ const bootstrapDatabase = async () => {
   await ensureUserTelegramConnectionsTable()
   await ensureTelegramConnectedColumn()
   await ensureTelegramConnectedSync()
+  await ensureWithdrawActivationTokensTable()
   await ensureCommissionLevelsTable()
   console.log('[bootstrap-database] telegram config e conexões garantidas')
+  console.log('[bootstrap-database] withdraw_activation_tokens table ensured')
   console.log('[bootstrap-database] commission_levels table ensured')
 }
 
@@ -1361,6 +1509,25 @@ app.get('/api/health', async (_req, res) => {
 })
 
 // ─── Register ────────────────────────────────────────────────────────────────
+const ensureUserRouletteSpinsTable = async () => {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS user_roulette_spins (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id BIGINT UNSIGNED NOT NULL,
+      available_spins INT NOT NULL DEFAULT 0,
+      total_earned INT NOT NULL DEFAULT 0,
+      total_used INT NOT NULL DEFAULT 0,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_user_roulette_spins_user_id (user_id),
+      KEY idx_user_roulette_spins_available (available_spins)
+    )
+    `
+  )
+}
+
 app.post('/api/auth/register', async (req, res) => {
   const { name, phone, password, referralCode } = req.body as {
     name?: string
@@ -1414,6 +1581,21 @@ app.post('/api/auth/register', async (req, res) => {
     ) as any
 
     const userId = result.insertId
+
+    if (referredByUserId) {
+      await ensureUserRouletteSpinsTable()
+      await pool.query(
+        `
+        INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
+        VALUES (?, 1, 1, 0)
+        ON DUPLICATE KEY UPDATE
+          available_spins = COALESCE(available_spins, 0) + 1,
+          total_earned = COALESCE(total_earned, 0) + 1,
+          updated_at = NOW()
+        `,
+        [referredByUserId]
+      )
+    }
 
     // Gerar JWT
     const token = jwt.sign({ id: userId, phone }, JWT_SECRET, {
@@ -1731,6 +1913,32 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
             [Number(existing.amount ?? amountBRL), Number(existing.amount ?? amountBRL), existing.user_id]
           )
 
+          const [depositorRows] = await pool.query<RowDataPacket[]>(
+            `
+            SELECT referred_by_user_id AS referredByUserId
+            FROM users
+            WHERE id = ?
+            LIMIT 1
+            `,
+            [Number(existing.user_id)]
+          )
+
+          const referredByUserId = Number(depositorRows[0]?.referredByUserId ?? 0)
+          if (referredByUserId > 0) {
+            await ensureUserRouletteSpinsTable()
+            await pool.query(
+              `
+              INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
+              VALUES (?, 1, 1, 0)
+              ON DUPLICATE KEY UPDATE
+                available_spins = COALESCE(available_spins, 0) + 1,
+                total_earned = COALESCE(total_earned, 0) + 1,
+                updated_at = NOW()
+              `,
+              [referredByUserId]
+            )
+          }
+
           await applyReferralCommissionsForDeposit(
             Number(existing.id),
             Number(existing.user_id),
@@ -1780,6 +1988,32 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           `,
           [amountBRL, amountBRL, userId]
         )
+
+        const [depositorRows] = await pool.query<RowDataPacket[]>(
+          `
+          SELECT referred_by_user_id AS referredByUserId
+          FROM users
+          WHERE id = ?
+          LIMIT 1
+          `,
+          [userId]
+        )
+
+        const referredByUserId = Number(depositorRows[0]?.referredByUserId ?? 0)
+        if (referredByUserId > 0) {
+          await ensureUserRouletteSpinsTable()
+          await pool.query(
+            `
+            INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
+            VALUES (?, 1, 1, 0)
+            ON DUPLICATE KEY UPDATE
+              available_spins = COALESCE(available_spins, 0) + 1,
+              total_earned = COALESCE(total_earned, 0) + 1,
+              updated_at = NOW()
+            `,
+            [referredByUserId]
+          )
+        }
 
         const [createdRows] = await pool.query<RowDataPacket[]>(
           `
@@ -1856,6 +2090,7 @@ app.get('/api/referral/:userId', async (req, res) => {
 
 app.get('/api/dashboard/cycle-products', async (_req, res) => {
   try {
+    await ensureCycleProductsTable()
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
@@ -1890,6 +2125,253 @@ app.get('/api/dashboard/cycle-products', async (_req, res) => {
   } catch (err) {
     console.error('[dashboard-cycle-products]', err)
     res.status(500).json({ ok: false, error: 'Erro ao listar planos de ciclo.' })
+  }
+})
+
+app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
+  try {
+    await ensureCycleProductsTable()
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        id,
+        name,
+        description,
+        amount,
+        profit,
+        cycle_days AS cycleDays,
+        image_url AS imageUrl,
+        is_active AS isActive,
+        sort_order AS sortOrder,
+        created_at AS createdAt
+      FROM cycle_products
+      ORDER BY sort_order ASC, id ASC
+      `
+    )
+
+    const products = rows.map((row) => ({
+      id: Number(row.id),
+      name: String(row.name ?? ''),
+      description: String(row.description ?? ''),
+      imageUrl: String(row.imageUrl ?? ''),
+      price: Number(row.amount ?? 0),
+      redeemRewardValue: Number(row.profit ?? 0),
+      cycleDays: Number(row.cycleDays ?? 0),
+      isActive: Number(row.isActive ?? 1) === 1,
+      sortOrder: Number(row.sortOrder ?? 0),
+      createdAt: row.createdAt ?? null,
+    }))
+
+    res.json({ ok: true, products })
+  } catch (err) {
+    console.error('[admin-cycle-products-list]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar produtos de ciclo.' })
+  }
+})
+
+app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
+  const { name, description, imageUrl, price, redeemRewardValue, isActive, cycleDays, sortOrder } = req.body as {
+    name?: string
+    description?: string
+    imageUrl?: string
+    price?: number | string
+    redeemRewardValue?: number | string
+    isActive?: boolean | number | string
+    cycleDays?: number | string
+    sortOrder?: number | string
+  }
+
+  const parsedName = String(name ?? '').trim()
+  const parsedDescription = String(description ?? '').trim()
+  const parsedImageUrl = String(imageUrl ?? '').trim()
+  const parsedPrice = Number(String(price ?? '').replace(',', '.'))
+  const parsedRedeemRewardValue = Number(String(redeemRewardValue ?? '').replace(',', '.'))
+  const parsedCycleDays = Number(String(cycleDays ?? 0))
+  const parsedSortOrder = Number(String(sortOrder ?? 0))
+  const parsedIsActive =
+    isActive === true || isActive === 1 || String(isActive ?? '').toLowerCase() === 'true' ? 1 : 0
+
+  if (!parsedName) {
+    res.status(400).json({ ok: false, error: 'Nome do produto é obrigatório.' })
+    return
+  }
+
+  if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
+    res.status(400).json({ ok: false, error: 'Preço inválido.' })
+    return
+  }
+
+  if (!Number.isFinite(parsedRedeemRewardValue) || parsedRedeemRewardValue < 0) {
+    res.status(400).json({ ok: false, error: 'Valor de resgate inválido.' })
+    return
+  }
+
+  if (!Number.isInteger(parsedCycleDays) || parsedCycleDays < 0) {
+    res.status(400).json({ ok: false, error: 'Ciclo (dias) inválido.' })
+    return
+  }
+
+  try {
+    await ensureCycleProductsTable()
+
+    const [result] = await pool.query(
+      `
+      INSERT INTO cycle_products
+      (
+        name,
+        description,
+        amount,
+        profit,
+        cycle_days,
+        image_url,
+        is_active,
+        sort_order
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        parsedName,
+        parsedDescription || null,
+        Number(parsedPrice.toFixed(2)),
+        Number(parsedRedeemRewardValue.toFixed(2)),
+        parsedCycleDays,
+        parsedImageUrl || null,
+        parsedIsActive,
+        Number.isFinite(parsedSortOrder) ? parsedSortOrder : 0,
+      ]
+    ) as any
+
+    res.status(201).json({
+      ok: true,
+      message: 'Produto criado com sucesso.',
+      product: {
+        id: Number(result?.insertId ?? 0),
+        name: parsedName,
+      },
+    })
+  } catch (err) {
+    console.error('[admin-cycle-products-create]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao criar produto.' })
+  }
+})
+
+app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
+  const productId = Number(req.params.id)
+  const { name, description, imageUrl, price, redeemRewardValue, isActive, cycleDays, sortOrder } = req.body as {
+    name?: string
+    description?: string
+    imageUrl?: string
+    price?: number | string
+    redeemRewardValue?: number | string
+    isActive?: boolean | number | string
+    cycleDays?: number | string
+    sortOrder?: number | string
+  }
+
+  if (!productId || Number.isNaN(productId)) {
+    res.status(400).json({ ok: false, error: 'ID do produto inválido.' })
+    return
+  }
+
+  const parsedName = String(name ?? '').trim()
+  const parsedDescription = String(description ?? '').trim()
+  const parsedImageUrl = String(imageUrl ?? '').trim()
+  const parsedPrice = Number(String(price ?? '').replace(',', '.'))
+  const parsedRedeemRewardValue = Number(String(redeemRewardValue ?? '').replace(',', '.'))
+  const parsedCycleDays = Number(String(cycleDays ?? 0))
+  const parsedSortOrder = Number(String(sortOrder ?? 0))
+  const parsedIsActive =
+    isActive === true || isActive === 1 || String(isActive ?? '').toLowerCase() === 'true' ? 1 : 0
+
+  if (!parsedName) {
+    res.status(400).json({ ok: false, error: 'Nome do produto é obrigatório.' })
+    return
+  }
+
+  if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
+    res.status(400).json({ ok: false, error: 'Preço inválido.' })
+    return
+  }
+
+  if (!Number.isFinite(parsedRedeemRewardValue) || parsedRedeemRewardValue < 0) {
+    res.status(400).json({ ok: false, error: 'Valor de resgate inválido.' })
+    return
+  }
+
+  if (!Number.isInteger(parsedCycleDays) || parsedCycleDays < 0) {
+    res.status(400).json({ ok: false, error: 'Ciclo (dias) inválido.' })
+    return
+  }
+
+  try {
+    await ensureCycleProductsTable()
+
+    const [result] = await pool.query(
+      `
+      UPDATE cycle_products
+      SET
+        name = ?,
+        description = ?,
+        amount = ?,
+        profit = ?,
+        cycle_days = ?,
+        image_url = ?,
+        is_active = ?,
+        sort_order = ?,
+        updated_at = NOW()
+      WHERE id = ?
+      `,
+      [
+        parsedName,
+        parsedDescription || null,
+        Number(parsedPrice.toFixed(2)),
+        Number(parsedRedeemRewardValue.toFixed(2)),
+        parsedCycleDays,
+        parsedImageUrl || null,
+        parsedIsActive,
+        Number.isFinite(parsedSortOrder) ? parsedSortOrder : 0,
+        productId,
+      ]
+    ) as any
+
+    if (Number(result?.affectedRows ?? 0) <= 0) {
+      res.status(404).json({ ok: false, error: 'Produto não encontrado.' })
+      return
+    }
+
+    res.json({ ok: true, message: 'Produto atualizado com sucesso.' })
+  } catch (err) {
+    console.error('[admin-cycle-products-update]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao atualizar produto.' })
+  }
+})
+
+app.delete('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
+  const productId = Number(req.params.id)
+
+  if (!productId || Number.isNaN(productId)) {
+    res.status(400).json({ ok: false, error: 'ID do produto inválido.' })
+    return
+  }
+
+  try {
+    await ensureCycleProductsTable()
+
+    const [result] = await pool.query(
+      'DELETE FROM cycle_products WHERE id = ?',
+      [productId]
+    ) as any
+
+    if (Number(result?.affectedRows ?? 0) <= 0) {
+      res.status(404).json({ ok: false, error: 'Produto não encontrado.' })
+      return
+    }
+
+    res.json({ ok: true, message: 'Produto apagado com sucesso.' })
+  } catch (err) {
+    console.error('[admin-cycle-products-delete]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao apagar produto.' })
   }
 })
 
@@ -2916,6 +3398,53 @@ app.get('/api/team/members/:userId', async (req, res) => {
   }
 })
 
+app.get('/api/roleta/spins-available/:userId', async (req, res) => {
+  const userId = Number(req.params.userId)
+
+  if (!userId || Number.isNaN(userId)) {
+    res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  try {
+    await ensureUserRouletteSpinsTable()
+
+    const [users] = await pool.query<RowDataPacket[]>(
+      'SELECT id FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    )
+
+    if (users.length === 0) {
+      res.status(404).json({ ok: false, error: 'Usuário não encontrado.' })
+      return
+    }
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        available_spins AS availableSpins,
+        total_earned AS totalEarned,
+        total_used AS totalUsed
+      FROM user_roulette_spins
+      WHERE user_id = ?
+      LIMIT 1
+      `,
+      [userId]
+    )
+
+    res.json({
+      ok: true,
+      userId,
+      availableSpins: Number(rows[0]?.availableSpins ?? 0),
+      totalEarned: Number(rows[0]?.totalEarned ?? 0),
+      totalUsed: Number(rows[0]?.totalUsed ?? 0),
+    })
+  } catch (err) {
+    console.error('[roleta-spins-available]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar giros disponíveis.' })
+  }
+})
+
 app.post('/api/roleta/spin', async (req, res) => {
   const { userId } = req.body as { userId?: number }
   const parsedUserId = Number(userId)
@@ -2925,26 +3454,67 @@ app.post('/api/roleta/spin', async (req, res) => {
     return
   }
 
-  const prizes = ['7 BRL', '16 BRL', '35 BRL', '73 BRL', '183 BRL', '16600 BRL', '50 BRL', '90 BRL']
-  const selectedIndex = Math.floor(Math.random() * prizes.length)
-  const selectedPrize = prizes[selectedIndex]
-  const segmentAngle = 360 / prizes.length
-  const pointerAngle = 270
-  const targetCenterAngle = selectedIndex * segmentAngle + segmentAngle / 2
-  const rotationFinal = 2160 + (pointerAngle - targetCenterAngle)
+  const fixedPrizeAmount = 1
+  const selectedPrize = '1 BRL'
+  const selectedIndex = 0
+  const rotationFinal = 2160 + 45
 
+  const conn = await pool.getConnection()
   try {
-    const [users] = await pool.query<RowDataPacket[]>(
-      'SELECT id FROM users WHERE id = ? LIMIT 1',
+    await ensureUserRouletteSpinsTable()
+    await conn.beginTransaction()
+
+    const [users] = await conn.query<RowDataPacket[]>(
+      'SELECT id, balance FROM users WHERE id = ? LIMIT 1 FOR UPDATE',
       [parsedUserId]
     )
 
     if (users.length === 0) {
+      await conn.rollback()
       res.status(404).json({ ok: false, error: 'Usuário não encontrado.' })
       return
     }
 
-    await pool.query(
+    const [spinRows] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT available_spins AS availableSpins
+      FROM user_roulette_spins
+      WHERE user_id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [parsedUserId]
+    )
+
+    const availableSpins = Number(spinRows[0]?.availableSpins ?? 0)
+    if (availableSpins <= 0) {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: 'Você não possui giros disponíveis.' })
+      return
+    }
+
+    await conn.query(
+      `
+      UPDATE user_roulette_spins
+      SET
+        available_spins = COALESCE(available_spins, 0) - 1,
+        total_used = COALESCE(total_used, 0) + 1,
+        updated_at = NOW()
+      WHERE user_id = ?
+      `,
+      [parsedUserId]
+    )
+
+    await conn.query(
+      `
+      UPDATE users
+      SET balance = COALESCE(balance, 0) + ?
+      WHERE id = ?
+      `,
+      [fixedPrizeAmount, parsedUserId]
+    )
+
+    await conn.query(
       `
       CREATE TABLE IF NOT EXISTS roulette_spins (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -2961,14 +3531,72 @@ app.post('/api/roleta/spin', async (req, res) => {
       `
     )
 
-    const [result] = await pool.query(
+    const [result] = await conn.query(
       `
       INSERT INTO roulette_spins
       (user_id, prize_label, prize_index, rotation_final, source)
       VALUES (?, ?, ?, ?, ?)
       `,
-      [parsedUserId, selectedPrize, selectedIndex, rotationFinal, 'roleta_page']
+      [parsedUserId, selectedPrize, selectedIndex, rotationFinal, 'invite_level_1_reward']
     ) as any
+
+    await conn.query(
+      `
+      CREATE TABLE IF NOT EXISTS logs (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NULL,
+        entity_type VARCHAR(60) NOT NULL,
+        entity_id BIGINT UNSIGNED NULL,
+        action VARCHAR(100) NOT NULL,
+        old_balance DECIMAL(12,2) NULL,
+        new_balance DECIMAL(12,2) NULL,
+        amount DECIMAL(12,2) NULL,
+        metadata JSON NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_logs_user_id (user_id),
+        KEY idx_logs_entity_type (entity_type),
+        KEY idx_logs_entity_id (entity_id),
+        KEY idx_logs_action (action),
+        KEY idx_logs_created_at (created_at)
+      )
+      `
+    )
+
+    const oldBalance = Number(users[0].balance ?? 0)
+    const newBalance = Number((oldBalance + fixedPrizeAmount).toFixed(2))
+
+    await conn.query(
+      `
+      INSERT INTO logs
+      (
+        user_id,
+        entity_type,
+        entity_id,
+        action,
+        old_balance,
+        new_balance,
+        amount,
+        metadata
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        parsedUserId,
+        'roulette',
+        Number(result?.insertId ?? 0),
+        'roulette_spin_invite_reward',
+        Number(oldBalance.toFixed(2)),
+        newBalance,
+        Number(fixedPrizeAmount.toFixed(2)),
+        JSON.stringify({
+          prizeLabel: selectedPrize,
+          source: 'invite_level_1_reward',
+        }),
+      ]
+    )
+
+    await conn.commit()
 
     res.json({
       ok: true,
@@ -2980,10 +3608,16 @@ app.post('/api/roleta/spin', async (req, res) => {
         rotationFinal,
         createdAt: new Date().toISOString(),
       },
+      rewardAmount: Number(fixedPrizeAmount.toFixed(2)),
+      availableSpinsAfter: Math.max(availableSpins - 1, 0),
+      balanceAfter: newBalance,
     })
   } catch (err) {
+    await conn.rollback()
     console.error('[roleta-spin]', err)
     res.status(500).json({ ok: false, error: 'Erro ao registrar giro da roleta.' })
+  } finally {
+    conn.release()
   }
 })
 
@@ -4217,6 +4851,89 @@ app.post('/api/user/change-password', async (req, res) => {
   }
 })
 
+app.post('/api/withdraw/activation-token', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const { userId } = req.body as { userId?: number }
+  const parsedUserId = Number(userId)
+
+  if (!parsedUserId || Number.isNaN(parsedUserId)) {
+    res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  if (Number(req.authUser?.id ?? 0) !== parsedUserId) {
+    res.status(403).json({ ok: false, error: 'Ação não permitida para este usuário.' })
+    return
+  }
+
+  try {
+    const token = await createWithdrawActivationToken(parsedUserId)
+    res.json({
+      ok: true,
+      token,
+      message: `Ative o saque para mim: ${token}`,
+      expiresInMinutes: 30,
+    })
+  } catch (err) {
+    console.error('[withdraw-activation-token]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao gerar token de ativação de saque.' })
+  }
+})
+
+app.get('/api/withdraw/activation-status/:userId', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const parsedUserId = Number(req.params.userId)
+
+  if (!parsedUserId || Number.isNaN(parsedUserId)) {
+    res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  if (Number(req.authUser?.id ?? 0) !== parsedUserId) {
+    res.status(403).json({ ok: false, error: 'Ação não permitida para este usuário.' })
+    return
+  }
+
+  try {
+    await ensureWithdrawActivationTokensTable()
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        id,
+        activated_at AS activatedAt,
+        DATE_ADD(activated_at, INTERVAL 24 HOUR) AS expiresAt
+      FROM withdraw_activation_tokens
+      WHERE user_id = ?
+        AND status = 'activated'
+        AND activated_at IS NOT NULL
+        AND activated_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+      ORDER BY activated_at DESC, id DESC
+      LIMIT 1
+      `,
+      [parsedUserId]
+    )
+
+    if (rows.length === 0) {
+      res.json({
+        ok: true,
+        isActivated: false,
+        activatedAt: null,
+        expiresAt: null,
+      })
+      return
+    }
+
+    res.json({
+      ok: true,
+      isActivated: true,
+      activatedAt: rows[0].activatedAt ?? null,
+      expiresAt: rows[0].expiresAt ?? null,
+    })
+  } catch (err) {
+    console.error('[withdraw-activation-status]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao consultar status de ativação de saque.' })
+  }
+})
+
 app.post('/api/withdraw/request', async (req, res) => {
   const { userId, amount, withdrawPassword } = req.body as {
     userId?: number
@@ -4303,6 +5020,34 @@ app.post('/api/withdraw/request', async (req, res) => {
       res.status(401).json({ ok: false, error: 'Senha de saque incorreta.' })
       return
     }
+
+    await ensureWithdrawActivationTokensTable()
+
+    const [activationRows] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT id
+      FROM withdraw_activation_tokens
+      WHERE user_id = ?
+        AND status = 'activated'
+        AND activated_at IS NOT NULL
+        AND activated_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+      ORDER BY activated_at DESC, id DESC
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [parsedUserId]
+    )
+
+    if (activationRows.length === 0) {
+      await conn.rollback()
+      res.status(400).json({
+        ok: false,
+        error: 'Saque não ativado. Envie no grupo permitido: "Ative o saque para mim: TOKEN".',
+      })
+      return
+    }
+
+    const activationTokenId = Number(activationRows[0].id ?? 0)
 
     const [todayRows] = await conn.query<RowDataPacket[]>(
       `
@@ -4553,8 +5298,18 @@ app.post('/api/withdraw/request', async (req, res) => {
           externalId,
           autoApprove: shouldAutoApprove,
           providerTransactionId,
+          activationTokenId,
         }),
       ]
+    )
+
+    await conn.query(
+      `
+      UPDATE withdraw_activation_tokens
+      SET status = 'expired', updated_at = NOW()
+      WHERE id = ?
+      `,
+      [activationTokenId]
     )
 
     await conn.commit()
@@ -4875,6 +5630,62 @@ app.post('/api/withdraw/webhook', async (req, res) => {
     res.status(500).json({ ok: false, error: 'Erro ao processar webhook de saque.' })
   }
 })
+
+const ensureCycleProductsTable = async () => {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS cycle_products (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      name VARCHAR(150) NOT NULL,
+      description TEXT NULL,
+      amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      profit DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      cycle_days INT NOT NULL DEFAULT 0,
+      image_url VARCHAR(500) NULL,
+      is_active TINYINT(1) NOT NULL DEFAULT 1,
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_cycle_products_active (is_active),
+      KEY idx_cycle_products_sort (sort_order)
+    )
+    `
+  )
+
+  const tryAlter = async (sql: string) => {
+    try {
+      await pool.query(sql)
+    } catch {
+      // coluna já existe / alteração não necessária
+    }
+  }
+
+  await tryAlter(`
+    ALTER TABLE cycle_products
+    ADD COLUMN description TEXT NULL
+  `)
+
+  await tryAlter(`
+    ALTER TABLE cycle_products
+    ADD COLUMN image_url VARCHAR(500) NULL
+  `)
+
+  await tryAlter(`
+    ALTER TABLE cycle_products
+    ADD COLUMN sort_order INT NOT NULL DEFAULT 0
+  `)
+
+  await tryAlter(`
+    ALTER TABLE cycle_products
+    ADD COLUMN is_active TINYINT(1) NOT NULL DEFAULT 1
+  `)
+
+  await tryAlter(`
+    ALTER TABLE cycle_products
+    ADD COLUMN cycle_days INT NOT NULL DEFAULT 0
+  `)
+}
 
 const ensureGiftVoucherTables = async () => {
   await pool.query(
