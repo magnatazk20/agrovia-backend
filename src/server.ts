@@ -1271,7 +1271,9 @@ const bootstrapDatabase = async () => {
   await ensureUserTelegramConnectionsTable()
   await ensureTelegramConnectedColumn()
   await ensureTelegramConnectedSync()
+  await ensureCommissionLevelsTable()
   console.log('[bootstrap-database] telegram config e conexões garantidas')
+  console.log('[bootstrap-database] commission_levels table ensured')
 }
 
 bootstrapDatabase().catch((err) => {
@@ -6113,7 +6115,7 @@ app.get('/api/referral/commission-levels', async (_req, res) => {
     res.json({ ok: true, levels })
   } catch (err) {
     console.error('[referral-commission-levels-get]', err)
-    res.status(500).json({ ok: false, error: 'Erro ao carregar níveis de comissão para convite.' })
+    res.status(500).json({ ok: false, error: 'Erro ao carregar níveis de comissão.' })
   }
 })
 
