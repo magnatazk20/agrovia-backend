@@ -1364,6 +1364,16 @@ const settleExpiredCyclesForUser = async (userId: number) => {
       return
     }
 
+    const [userRows] = await conn.query<RowDataPacket[]>(
+      'SELECT balance FROM users WHERE id = ? LIMIT 1 FOR UPDATE',
+      [userId]
+    )
+
+    if (userRows.length === 0) {
+      await conn.rollback()
+      return
+    }
+
     let totalProfit = 0
     const purchaseIds: number[] = []
 
@@ -1373,6 +1383,8 @@ const settleExpiredCyclesForUser = async (userId: number) => {
       if (purchaseId > 0) purchaseIds.push(purchaseId)
       if (profit > 0) totalProfit += profit
     }
+
+    const oldBalance = Number(userRows[0].balance ?? 0)
 
     if (totalProfit > 0) {
       await conn.query(
@@ -1396,6 +1408,71 @@ const settleExpiredCyclesForUser = async (userId: number) => {
           AND ends_at <= NOW()
         `,
         [userId]
+      )
+    }
+
+    const [updatedRows] = await conn.query<RowDataPacket[]>(
+      'SELECT balance FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    )
+
+    const newBalance = Number(updatedRows[0]?.balance ?? oldBalance)
+
+    if (purchaseIds.length > 0 && totalProfit > 0) {
+      await conn.query(
+        `
+        CREATE TABLE IF NOT EXISTS logs (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          user_id BIGINT UNSIGNED NULL,
+          entity_type VARCHAR(60) NOT NULL,
+          entity_id BIGINT UNSIGNED NULL,
+          action VARCHAR(100) NOT NULL,
+          old_balance DECIMAL(12,2) NULL,
+          new_balance DECIMAL(12,2) NULL,
+          amount DECIMAL(12,2) NULL,
+          metadata JSON NULL,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (id),
+          KEY idx_logs_user_id (user_id),
+          KEY idx_logs_entity_type (entity_type),
+          KEY idx_logs_entity_id (entity_id),
+          KEY idx_logs_action (action),
+          KEY idx_logs_created_at (created_at)
+        )
+        `
+      )
+
+      const lastPurchaseId = purchaseIds[purchaseIds.length - 1] ?? null
+
+      await conn.query(
+        `
+        INSERT INTO logs
+        (
+          user_id,
+          entity_type,
+          entity_id,
+          action,
+          old_balance,
+          new_balance,
+          amount,
+          metadata
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          userId,
+          'cycle',
+          lastPurchaseId,
+          'cycle_investment_completed_auto_credit',
+          Number(oldBalance.toFixed(2)),
+          Number(newBalance.toFixed(2)),
+          Number(totalProfit.toFixed(2)),
+          JSON.stringify({
+            purchaseIds,
+            completedCount: purchaseIds.length,
+            totalProfit: Number(totalProfit.toFixed(2)),
+          }),
+        ]
       )
     }
 
@@ -2102,24 +2179,34 @@ app.get('/api/dashboard/cycle-products', async (_req, res) => {
         cycle_days AS cycleDays,
         image_url AS imageUrl,
         is_active AS isActive,
-        sort_order AS sortOrder
+        sort_order AS sortOrder,
+        plan_type AS planType
       FROM cycle_products
       WHERE is_active = 1
       ORDER BY sort_order ASC, id ASC
       `
     )
 
-    const products = rows.map((row) => ({
-      id: Number(row.id),
-      name: String(row.name ?? ''),
-      description: String(row.description ?? ''),
-      amount: Number(row.amount ?? 0),
-      profit: Number(row.profit ?? 0),
-      cycleDays: Number(row.cycleDays ?? 0),
-      imageUrl: String(row.imageUrl ?? ''),
-      isActive: Number(row.isActive ?? 1) === 1,
-      sortOrder: Number(row.sortOrder ?? 0),
-    }))
+    const products = rows.map((row) => {
+      const rawPlanType = String(row.planType ?? 'normal').trim().toLowerCase()
+      const planType =
+        rawPlanType === 'vip' || rawPlanType === 'vip_day'
+          ? rawPlanType
+          : 'normal'
+
+      return {
+        id: Number(row.id),
+        name: String(row.name ?? ''),
+        description: String(row.description ?? ''),
+        amount: Number(row.amount ?? 0),
+        profit: Number(row.profit ?? 0),
+        cycleDays: Number(row.cycleDays ?? 0),
+        imageUrl: String(row.imageUrl ?? ''),
+        isActive: Number(row.isActive ?? 1) === 1,
+        sortOrder: Number(row.sortOrder ?? 0),
+        planType,
+      }
+    })
 
     res.json({ ok: true, products })
   } catch (err) {
@@ -2144,6 +2231,7 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
         image_url AS imageUrl,
         is_active AS isActive,
         sort_order AS sortOrder,
+        plan_type AS planType,
         created_at AS createdAt
       FROM cycle_products
       ORDER BY sort_order ASC, id ASC
@@ -2160,6 +2248,7 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
       cycleDays: Number(row.cycleDays ?? 0),
       isActive: Number(row.isActive ?? 1) === 1,
       sortOrder: Number(row.sortOrder ?? 0),
+      planType: String(row.planType ?? 'normal'),
       createdAt: row.createdAt ?? null,
     }))
 
@@ -2171,7 +2260,7 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
 })
 
 app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
-  const { name, description, imageUrl, price, redeemRewardValue, isActive, cycleDays, sortOrder } = req.body as {
+  const { name, description, imageUrl, price, redeemRewardValue, isActive, cycleDays, sortOrder, planType } = req.body as {
     name?: string
     description?: string
     imageUrl?: string
@@ -2180,6 +2269,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
     isActive?: boolean | number | string
     cycleDays?: number | string
     sortOrder?: number | string
+    planType?: string
   }
 
   const parsedName = String(name ?? '').trim()
@@ -2191,6 +2281,11 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
   const parsedSortOrder = Number(String(sortOrder ?? 0))
   const parsedIsActive =
     isActive === true || isActive === 1 || String(isActive ?? '').toLowerCase() === 'true' ? 1 : 0
+  const parsedPlanTypeRaw = String(planType ?? 'normal').trim().toLowerCase()
+  const parsedPlanType =
+    parsedPlanTypeRaw === 'vip' || parsedPlanTypeRaw === 'vip_day'
+      ? parsedPlanTypeRaw
+      : 'normal'
 
   if (!parsedName) {
     res.status(400).json({ ok: false, error: 'Nome do produto é obrigatório.' })
@@ -2226,9 +2321,10 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         cycle_days,
         image_url,
         is_active,
-        sort_order
+        sort_order,
+        plan_type
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         parsedName,
@@ -2239,6 +2335,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         parsedImageUrl || null,
         parsedIsActive,
         Number.isFinite(parsedSortOrder) ? parsedSortOrder : 0,
+        parsedPlanType,
       ]
     ) as any
 
@@ -2258,7 +2355,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
 
 app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
   const productId = Number(req.params.id)
-  const { name, description, imageUrl, price, redeemRewardValue, isActive, cycleDays, sortOrder } = req.body as {
+  const { name, description, imageUrl, price, redeemRewardValue, isActive, cycleDays, sortOrder, planType } = req.body as {
     name?: string
     description?: string
     imageUrl?: string
@@ -2267,6 +2364,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
     isActive?: boolean | number | string
     cycleDays?: number | string
     sortOrder?: number | string
+    planType?: string
   }
 
   if (!productId || Number.isNaN(productId)) {
@@ -2283,6 +2381,11 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
   const parsedSortOrder = Number(String(sortOrder ?? 0))
   const parsedIsActive =
     isActive === true || isActive === 1 || String(isActive ?? '').toLowerCase() === 'true' ? 1 : 0
+  const parsedPlanTypeRaw = String(planType ?? 'normal').trim().toLowerCase()
+  const parsedPlanType =
+    parsedPlanTypeRaw === 'vip' || parsedPlanTypeRaw === 'vip_day'
+      ? parsedPlanTypeRaw
+      : 'normal'
 
   if (!parsedName) {
     res.status(400).json({ ok: false, error: 'Nome do produto é obrigatório.' })
@@ -2319,6 +2422,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         image_url = ?,
         is_active = ?,
         sort_order = ?,
+        plan_type = ?,
         updated_at = NOW()
       WHERE id = ?
       `,
@@ -2331,6 +2435,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         parsedImageUrl || null,
         parsedIsActive,
         Number.isFinite(parsedSortOrder) ? parsedSortOrder : 0,
+        parsedPlanType,
         productId,
       ]
     ) as any
