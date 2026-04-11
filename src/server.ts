@@ -2210,7 +2210,7 @@ app.post('/api/monthly-salary-plans/claim', async (req, res) => {
 
     const [userRows] = await conn.query<RowDataPacket[]>(
       `
-      SELECT id, monthly_salary_contract AS monthlySalaryContract
+      SELECT id, phone, monthly_salary_contract AS monthlySalaryContract
       FROM users
       WHERE id = ?
       LIMIT 1
@@ -2333,6 +2333,44 @@ app.post('/api/monthly-salary-plans/claim', async (req, res) => {
     )
 
     await conn.commit()
+
+    try {
+      const [telegramRows] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT
+          bot_token AS botToken,
+          group_id AS groupId
+        FROM system_telegram_config
+        WHERE TRIM(bot_token) <> ''
+          AND TRIM(group_id) <> ''
+        ORDER BY id ASC
+        LIMIT 1
+        `
+      )
+
+      const botToken = String(telegramRows[0]?.botToken ?? '').trim()
+      const groupId = String(telegramRows[0]?.groupId ?? '').trim()
+
+      const rawPhone = String(userRows[0]?.phone ?? '').replace(/\D/g, '')
+      const maskedPhone =
+        rawPhone.length >= 8
+          ? `${rawPhone.slice(0, 1)}***${rawPhone.slice(Math.max(rawPhone.length - 5, 1), Math.max(rawPhone.length - 4, 2))}***${rawPhone.slice(-2)}`
+          : (rawPhone || '***')
+
+      if (botToken && groupId) {
+        const announcementMessage = `📢 【Anúncio Oficial NOOR: Boletim de Promoção de Promotores】 🎁
+
+Parabéns ao usuário Telefone: ${maskedPhone} por ter sido promovido a Promotor ${contractLabel}
+
+Agora ele receberá um salario mensal de R$100,00 em sua conta creditado todos os meses.
+
+💡 Ao convidar amigos para se cadastrar e operar na plataforma, você não só ganha generosas recompensas em dinheiro por promoção, como também recebe comissões permanentes sobre taxas e ganhos de suas subcontas.`
+
+        await sendTelegramMessage(botToken, groupId, announcementMessage)
+      }
+    } catch (telegramErr) {
+      console.error('[monthly-salary-claim-telegram-announcement]', telegramErr)
+    }
 
     res.json({
       ok: true,
