@@ -2232,6 +2232,7 @@ app.post('/api/monthly-salary-plans/claim', async (req, res) => {
       SELECT
         id,
         title,
+        monthly_salary AS monthlySalary,
         required_level1_deposited AS requiredLevel1Deposited,
         required_level2_deposited AS requiredLevel2Deposited,
         required_level3_deposited AS requiredLevel3Deposited,
