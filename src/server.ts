@@ -1631,6 +1631,117 @@ const ensureUserRouletteSpinsTable = async () => {
   )
 }
 
+const ensureRouletteCodesTable = async () => {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS roulette_codes (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      code VARCHAR(120) NOT NULL,
+      reward_label VARCHAR(255) NULL,
+      description TEXT NULL,
+      created_by_user_id BIGINT UNSIGNED NULL,
+      is_active TINYINT(1) NOT NULL DEFAULT 1,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_roulette_codes_code (code),
+      KEY idx_roulette_codes_active (is_active),
+      KEY idx_roulette_codes_created_by (created_by_user_id)
+    )
+    `
+  )
+}
+
+app.get('/api/admin/roulette-codes', requireMaxAdmin, async (_req: AuthenticatedRequest, res) => {
+  try {
+    await ensureRouletteCodesTable()
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        id,
+        code,
+        reward_label AS reward,
+        description,
+        is_active AS isActive,
+        created_by_user_id AS createdByUserId,
+        created_at AS createdAt
+      FROM roulette_codes
+      ORDER BY id DESC
+      `
+    )
+
+    const rouletteCodes = rows.map((row) => ({
+      id: Number(row.id ?? 0),
+      code: String(row.code ?? ''),
+      reward: String(row.reward ?? ''),
+      description: String(row.description ?? ''),
+      isActive: Number(row.isActive ?? 1) === 1,
+      createdByUserId: row.createdByUserId == null ? null : Number(row.createdByUserId),
+      createdAt: row.createdAt ?? null,
+    }))
+
+    res.json({ ok: true, rouletteCodes })
+  } catch (err) {
+    console.error('[admin-roulette-codes-list]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao listar códigos da roleta.' })
+  }
+})
+
+app.post('/api/admin/roulette-codes', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
+  const { code, reward, description } = req.body as {
+    code?: string
+    reward?: string
+    description?: string
+  }
+
+  const normalizedCode = String(code ?? '').trim().toUpperCase()
+  const normalizedReward = String(reward ?? '').trim()
+  const normalizedDescription = String(description ?? '').trim()
+
+  if (!normalizedCode) {
+    res.status(400).json({ ok: false, error: 'Informe um código para a roleta.' })
+    return
+  }
+
+  try {
+    await ensureRouletteCodesTable()
+
+    const [result] = await pool.query(
+      `
+      INSERT INTO roulette_codes
+      (code, reward_label, description, created_by_user_id, is_active)
+      VALUES (?, ?, ?, ?, 1)
+      `,
+      [
+        normalizedCode,
+        normalizedReward || null,
+        normalizedDescription || null,
+        Number(req.authUser?.id ?? 0) || null,
+      ]
+    ) as any
+
+    res.status(201).json({
+      ok: true,
+      message: `Código "${normalizedCode}" criado com sucesso.`,
+      rouletteCode: {
+        id: Number(result?.insertId ?? 0),
+        code: normalizedCode,
+        reward: normalizedReward,
+        description: normalizedDescription,
+      },
+    })
+  } catch (err: any) {
+    if (String(err?.code ?? '') === 'ER_DUP_ENTRY') {
+      res.status(409).json({ ok: false, error: 'Este código da roleta já existe.' })
+      return
+    }
+
+    console.error('[admin-roulette-codes-create]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao criar código da roleta.' })
+  }
+})
+
 app.post('/api/auth/register', async (req, res) => {
   const { name, phone, password, referralCode } = req.body as {
     name?: string
