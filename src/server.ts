@@ -13117,7 +13117,7 @@ async function loadActiveCaixasBoxPrizes() {
   }))
 }
 
-function weightedRandomBox(items: Array<{ prizeKey: string; label: string; type: string; value: number; probability: number }>) {
+function weightedRandomBox(items: Array<{ prizeKey: string; label: string; type: string; value: number; probability: number; imageUrl?: string | null }>) {
   const total = items.reduce((acc, i) => acc + i.probability, 0)
   let rand = Math.random() * total
   for (const item of items) {
