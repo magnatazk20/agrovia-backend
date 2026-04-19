@@ -2924,6 +2924,53 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
   }
 })
 
+/* GET /api/cashin/status/:transactionId — polling de status do pagamento */
+app.get('/api/cashin/status/:transactionId', async (req: Request, res: Response): Promise<void> => {
+  const { transactionId } = req.params
+  if (!transactionId) {
+    res.status(400).json({ error: 'transactionId obrigatório.' })
+    return
+  }
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, status, amount, user_id, paid_at AS paidAt
+       FROM cashin_payments
+       WHERE provider_transaction_id = ?
+       LIMIT 1`,
+      [String(transactionId)]
+    )
+    if (!rows.length) {
+      res.status(404).json({ error: 'Pagamento não encontrado.' })
+      return
+    }
+    const row = rows[0] as { id: number; status: string; amount: number | string; user_id: number; paidAt: string | null }
+    const status = String(row.status ?? 'pending').toLowerCase()
+    const isPaid = status === 'paid' || status === 'payment.paid'
+
+    /* se pago, busca saldo atualizado do usuário */
+    let balance: number | null = null
+    if (isPaid && row.user_id) {
+      const [userRows] = await pool.query<RowDataPacket[]>(
+        'SELECT balance FROM users WHERE id = ? LIMIT 1',
+        [row.user_id]
+      )
+      if (userRows.length) balance = Number(userRows[0].balance ?? 0)
+    }
+
+    res.json({
+      ok:     true,
+      status,
+      isPaid,
+      amount: Number(row.amount ?? 0),
+      paidAt: row.paidAt ? String(row.paidAt) : null,
+      balance,
+    })
+  } catch (err) {
+    console.error('[cashin-status]', err)
+    res.status(500).json({ error: 'Erro ao consultar status.' })
+  }
+})
+
 // ════════════════════════════════════════════════════════════════════════════
 // DEPÓSITO PIX — LOJA (credita shop_balance, não balance)
 // ════════════════════════════════════════════════════════════════════════════
