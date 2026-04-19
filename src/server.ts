@@ -3975,7 +3975,11 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
 })
 
 app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
-  const { name, description, imageUrl, price, redeemRewardValue, isActive, cycleDays, sortOrder, planType, stockQuantity } = req.body as {
+  const {
+    name, description, imageUrl, price, redeemRewardValue, isActive,
+    cycleDays, sortOrder, planType, stockQuantity, expiresAt,
+    requireCommissionLevel1Count, requireCommissionLevel2Count, requireCommissionLevel3Count,
+  } = req.body as {
     name?: string
     description?: string
     imageUrl?: string
@@ -3986,6 +3990,10 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
     sortOrder?: number | string
     planType?: string
     stockQuantity?: number | string
+    expiresAt?: string | null
+    requireCommissionLevel1Count?: number | string
+    requireCommissionLevel2Count?: number | string
+    requireCommissionLevel3Count?: number | string
   }
 
   const parsedName = String(name ?? '').trim()
@@ -4003,6 +4011,10 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
     parsedPlanTypeRaw === 'vip' || parsedPlanTypeRaw === 'vip_day'
       ? parsedPlanTypeRaw
       : 'normal'
+  const parsedLevel1 = Math.max(0, Number(String(requireCommissionLevel1Count ?? 0)))
+  const parsedLevel2 = Math.max(0, Number(String(requireCommissionLevel2Count ?? 0)))
+  const parsedLevel3 = Math.max(0, Number(String(requireCommissionLevel3Count ?? 0)))
+  const parsedExpiresAt = parsedPlanType === 'vip_day' && expiresAt ? String(expiresAt) : null
 
   if (!parsedName) {
     res.status(400).json({ ok: false, error: 'Nome do produto é obrigatório.' })
@@ -4040,9 +4052,13 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         image_url,
         is_active,
         sort_order,
-        plan_type
+        plan_type,
+        expires_at,
+        require_commission_level1_count,
+        require_commission_level2_count,
+        require_commission_level3_count
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         parsedName,
@@ -4055,6 +4071,10 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         parsedIsActive,
         Number.isFinite(parsedSortOrder) ? parsedSortOrder : 0,
         parsedPlanType,
+        parsedExpiresAt,
+        parsedLevel1,
+        parsedLevel2,
+        parsedLevel3,
       ]
     ) as any
 
@@ -4074,7 +4094,11 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
 
 app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
   const productId = Number(req.params.id)
-  const { name, description, imageUrl, price, redeemRewardValue, isActive, cycleDays, sortOrder, planType, stockQuantity } = req.body as {
+  const {
+    name, description, imageUrl, price, redeemRewardValue, isActive,
+    cycleDays, sortOrder, planType, stockQuantity, expiresAt,
+    requireCommissionLevel1Count, requireCommissionLevel2Count, requireCommissionLevel3Count,
+  } = req.body as {
     name?: string
     description?: string
     imageUrl?: string
@@ -4085,6 +4109,10 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
     sortOrder?: number | string
     planType?: string
     stockQuantity?: number | string
+    expiresAt?: string | null
+    requireCommissionLevel1Count?: number | string
+    requireCommissionLevel2Count?: number | string
+    requireCommissionLevel3Count?: number | string
   }
 
   if (!productId || Number.isNaN(productId)) {
@@ -4107,6 +4135,10 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
     parsedPlanTypeRaw === 'vip' || parsedPlanTypeRaw === 'vip_day'
       ? parsedPlanTypeRaw
       : 'normal'
+  const parsedLevel1 = Math.max(0, Number(String(requireCommissionLevel1Count ?? 0)))
+  const parsedLevel2 = Math.max(0, Number(String(requireCommissionLevel2Count ?? 0)))
+  const parsedLevel3 = Math.max(0, Number(String(requireCommissionLevel3Count ?? 0)))
+  const parsedExpiresAt = parsedPlanType === 'vip_day' && expiresAt ? String(expiresAt) : null
 
   if (!parsedName) {
     res.status(400).json({ ok: false, error: 'Nome do produto é obrigatório.' })
@@ -4145,6 +4177,10 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         is_active = ?,
         sort_order = ?,
         plan_type = ?,
+        expires_at = ?,
+        require_commission_level1_count = ?,
+        require_commission_level2_count = ?,
+        require_commission_level3_count = ?,
         updated_at = NOW()
       WHERE id = ?
       `,
@@ -4159,6 +4195,10 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         parsedIsActive,
         Number.isFinite(parsedSortOrder) ? parsedSortOrder : 0,
         parsedPlanType,
+        parsedExpiresAt,
+        parsedLevel1,
+        parsedLevel2,
+        parsedLevel3,
         productId,
       ]
     ) as any
