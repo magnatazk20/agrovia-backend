@@ -12548,6 +12548,7 @@ app.get('/api/admin/users/:id/details', requireMaxAdmin, async (req, res) => {
         COALESCE(is_banned, 0) AS is_banned,
         created_at,
         COALESCE(balance, 0) AS balance,
+        COALESCE(shop_balance, 0) AS shopBalance,
         COALESCE(telegram_conectado, 0) AS telegramConectado,
         monthly_salary_contract AS activeContract
       FROM users
@@ -12615,6 +12616,23 @@ app.get('/api/admin/users/:id/details', requireMaxAdmin, async (req, res) => {
       totalVipPlansBought = Number(vipRows[0]?.total ?? 0)
     } catch {
       totalVipPlansBought = 0
+    }
+
+    // ── Total de compras de gift card na loja ──────────────────────────────────
+    let totalShopGiftCardPurchases = 0
+    try {
+      const [shopPurchaseRows] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT COUNT(*) AS total
+        FROM shop_balance_transactions
+        WHERE user_id = ?
+          AND type = 'debit'
+        `,
+        [userId]
+      )
+      totalShopGiftCardPurchases = Number(shopPurchaseRows[0]?.total ?? 0)
+    } catch {
+      totalShopGiftCardPurchases = 0
     }
 
     let accountLogs: Array<{
@@ -13124,12 +13142,14 @@ app.get('/api/admin/users/:id/details', requireMaxAdmin, async (req, res) => {
         is_banned: Number(user.is_banned ?? 0),
         created_at: user.created_at,
         balance: Number(user.balance ?? 0),
+        shopBalance: Number(user.shopBalance ?? 0),
         telegramConectado: Number(user.telegramConectado ?? 0),
         activeContract: user.activeContract == null ? null : String(user.activeContract),
         totalDepositsPaid: Number(depositRows[0]?.total ?? 0),
         totalWithdrawals,
         totalCyclePlansBought,
         totalVipPlansBought,
+        totalShopGiftCardPurchases,
         accountLogs,
         vipPurchases,
         cyclePurchases,
