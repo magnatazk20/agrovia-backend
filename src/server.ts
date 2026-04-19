@@ -3882,9 +3882,9 @@ app.get('/api/dashboard/cycle-products', async (_req, res) => {
         plan_type AS planType,
         stock_quantity AS stockQuantity,
         expires_at AS expiresAt,
-        COALESCE(require_commission_level1_count, require_commission_level_1_count, 0) AS requireCommissionLevel1Count,
-        COALESCE(require_commission_level2_count, require_commission_level_2_count, 0) AS requireCommissionLevel2Count,
-        COALESCE(require_commission_level3_count, require_commission_level_3_count, 0) AS requireCommissionLevel3Count
+        require_commission_level_1_count AS requireCommissionLevel1Count,
+        require_commission_level_2_count AS requireCommissionLevel2Count,
+        require_commission_level_3_count AS requireCommissionLevel3Count
       FROM cycle_products
       WHERE is_active = 1
       ORDER BY sort_order ASC, id ASC
@@ -3943,9 +3943,9 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
         plan_type AS planType,
         stock_quantity AS stockQuantity,
         expires_at AS expiresAt,
-        COALESCE(require_commission_level1_count, require_commission_level_1_count, 0) AS requireCommissionLevel1Count,
-        COALESCE(require_commission_level2_count, require_commission_level_2_count, 0) AS requireCommissionLevel2Count,
-        COALESCE(require_commission_level3_count, require_commission_level_3_count, 0) AS requireCommissionLevel3Count,
+        require_commission_level_1_count AS requireCommissionLevel1Count,
+        require_commission_level_2_count AS requireCommissionLevel2Count,
+        require_commission_level_3_count AS requireCommissionLevel3Count,
         created_at AS createdAt
       FROM cycle_products
       ORDER BY sort_order ASC, id ASC
@@ -4058,9 +4058,9 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         sort_order,
         plan_type,
         expires_at,
-        require_commission_level1_count,
-        require_commission_level2_count,
-        require_commission_level3_count
+        require_commission_level_1_count,
+        require_commission_level_2_count,
+        require_commission_level_3_count
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
@@ -4182,9 +4182,9 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         sort_order = ?,
         plan_type = ?,
         expires_at = ?,
-        require_commission_level1_count = ?,
-        require_commission_level2_count = ?,
-        require_commission_level3_count = ?,
+        require_commission_level_1_count = ?,
+        require_commission_level_2_count = ?,
+        require_commission_level_3_count = ?,
         updated_at = NOW()
       WHERE id = ?
       `,
@@ -8249,7 +8249,10 @@ const ensureCycleProductsTable = async () => {
       sort_order INT NOT NULL DEFAULT 0,
       stock_quantity INT NOT NULL DEFAULT 0,
       expires_at DATETIME NULL,
-      require_commission_level3_count INT NOT NULL DEFAULT 0,
+      plan_type VARCHAR(20) NOT NULL DEFAULT 'normal',
+      require_commission_level_1_count INT NOT NULL DEFAULT 0,
+      require_commission_level_2_count INT NOT NULL DEFAULT 0,
+      require_commission_level_3_count INT NOT NULL DEFAULT 0,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
@@ -8267,79 +8270,17 @@ const ensureCycleProductsTable = async () => {
     }
   }
 
-  await tryAlter(`
-    ALTER TABLE cycle_products
-    ADD COLUMN description TEXT NULL
-  `)
-
-  await tryAlter(`
-    ALTER TABLE cycle_products
-    ADD COLUMN image_url VARCHAR(500) NULL
-  `)
-
-  await tryAlter(`
-    ALTER TABLE cycle_products
-    ADD COLUMN sort_order INT NOT NULL DEFAULT 0
-  `)
-
-  await tryAlter(`
-    ALTER TABLE cycle_products
-    ADD COLUMN is_active TINYINT(1) NOT NULL DEFAULT 1
-  `)
-
-  await tryAlter(`
-    ALTER TABLE cycle_products
-    ADD COLUMN cycle_days INT NOT NULL DEFAULT 0
-  `)
-
-  await tryAlter(`
-    ALTER TABLE cycle_products
-    ADD COLUMN stock_quantity INT NOT NULL DEFAULT 0
-  `)
-
-  await tryAlter(`
-    ALTER TABLE cycle_products
-    ADD COLUMN expires_at DATETIME NULL
-  `)
-
-  await tryAlter(`
-    ALTER TABLE cycle_products
-    ADD COLUMN require_commission_level3_count INT NOT NULL DEFAULT 0
-  `)
-
-  await tryAlter(`
-    ALTER TABLE cycle_products
-    ADD COLUMN require_commission_level1_count INT NOT NULL DEFAULT 0
-  `)
-
-  await tryAlter(`
-    ALTER TABLE cycle_products
-    ADD COLUMN require_commission_level2_count INT NOT NULL DEFAULT 0
-  `)
-
-  // migra dados das colunas antigas (com underscore entre level e o número) para as novas
-  await tryAlter(`
-    UPDATE cycle_products
-    SET require_commission_level1_count = COALESCE(require_commission_level_1_count, 0)
-    WHERE require_commission_level1_count = 0 AND COALESCE(require_commission_level_1_count, 0) > 0
-  `)
-
-  await tryAlter(`
-    UPDATE cycle_products
-    SET require_commission_level2_count = COALESCE(require_commission_level_2_count, 0)
-    WHERE require_commission_level2_count = 0 AND COALESCE(require_commission_level_2_count, 0) > 0
-  `)
-
-  await tryAlter(`
-    UPDATE cycle_products
-    SET require_commission_level3_count = COALESCE(require_commission_level_3_count, 0)
-    WHERE require_commission_level3_count = 0 AND COALESCE(require_commission_level_3_count, 0) > 0
-  `)
-
-  await tryAlter(`
-    ALTER TABLE cycle_products
-    ADD COLUMN plan_type VARCHAR(20) NOT NULL DEFAULT 'normal'
-  `)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN description TEXT NULL`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN image_url VARCHAR(500) NULL`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN sort_order INT NOT NULL DEFAULT 0`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN is_active TINYINT(1) NOT NULL DEFAULT 1`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN cycle_days INT NOT NULL DEFAULT 0`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN stock_quantity INT NOT NULL DEFAULT 0`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN expires_at DATETIME NULL`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN plan_type VARCHAR(20) NOT NULL DEFAULT 'normal'`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN require_commission_level_1_count INT NOT NULL DEFAULT 0`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN require_commission_level_2_count INT NOT NULL DEFAULT 0`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN require_commission_level_3_count INT NOT NULL DEFAULT 0`)
 }
 
 type CommissionLevelRequirementInput = {
