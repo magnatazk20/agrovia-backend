@@ -10400,15 +10400,11 @@ app.get('/api/site-settings', async (_req, res) => {
     )
 
     try {
-      await pool.query(
-        `
-        ALTER TABLE site_settings
-        ADD COLUMN site_logo_url VARCHAR(500) NULL
-        `
-      )
-    } catch {
-      // coluna já existe
-    }
+      await pool.query(`ALTER TABLE site_settings ADD COLUMN site_logo_url VARCHAR(500) NULL`)
+    } catch { /* coluna já existe */ }
+    try {
+      await pool.query(`ALTER TABLE site_settings ADD COLUMN telegram_group_link VARCHAR(500) NULL`)
+    } catch { /* coluna já existe */ }
 
     const [rows] = await pool.query<RowDataPacket[]>(
       `
@@ -10416,6 +10412,7 @@ app.get('/api/site-settings', async (_req, res) => {
         site_title AS siteTitle,
         site_description AS siteDescription,
         COALESCE(site_logo_url, '') AS siteLogoUrl,
+        COALESCE(telegram_group_link, '') AS telegramGroupLink,
         updated_at AS updatedAt
       FROM site_settings
       ORDER BY id ASC
@@ -10430,6 +10427,7 @@ app.get('/api/site-settings', async (_req, res) => {
           siteTitle: '',
           siteDescription: '',
           siteLogoUrl: '',
+          telegramGroupLink: '',
           updatedAt: null,
         },
       })
@@ -10442,6 +10440,7 @@ app.get('/api/site-settings', async (_req, res) => {
         siteTitle: String(rows[0].siteTitle ?? ''),
         siteDescription: String(rows[0].siteDescription ?? ''),
         siteLogoUrl: String(rows[0].siteLogoUrl ?? ''),
+        telegramGroupLink: String(rows[0].telegramGroupLink ?? ''),
         updatedAt: rows[0].updatedAt ?? null,
       },
     })
@@ -10774,16 +10773,8 @@ app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
       `
     )
 
-    try {
-      await pool.query(
-        `
-        ALTER TABLE site_settings
-        ADD COLUMN site_logo_url VARCHAR(500) NULL
-        `
-      )
-    } catch {
-      // coluna já existe
-    }
+    try { await pool.query(`ALTER TABLE site_settings ADD COLUMN site_logo_url VARCHAR(500) NULL`) } catch { /* já existe */ }
+    try { await pool.query(`ALTER TABLE site_settings ADD COLUMN telegram_group_link VARCHAR(500) NULL`) } catch { /* já existe */ }
 
     const [rows] = await pool.query<RowDataPacket[]>(
       `
@@ -10792,6 +10783,7 @@ app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
         site_title AS siteTitle,
         site_description AS siteDescription,
         COALESCE(site_logo_url, '') AS siteLogoUrl,
+        COALESCE(telegram_group_link, '') AS telegramGroupLink,
         updated_at AS updatedAt
       FROM site_settings
       ORDER BY id ASC
@@ -10800,22 +10792,8 @@ app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
     )
 
     if (rows.length === 0) {
-      await pool.query(
-        `
-        INSERT INTO site_settings (site_title, site_description, site_logo_url)
-        VALUES ('', '', '')
-        `
-      )
-
-      res.json({
-        ok: true,
-        settings: {
-          siteTitle: '',
-          siteDescription: '',
-          siteLogoUrl: '',
-          updatedAt: null,
-        },
-      })
+      await pool.query(`INSERT INTO site_settings (site_title, site_description, site_logo_url) VALUES ('', '', '')`)
+      res.json({ ok: true, settings: { siteTitle: '', siteDescription: '', siteLogoUrl: '', telegramGroupLink: '', updatedAt: null } })
       return
     }
 
@@ -10825,6 +10803,7 @@ app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
         siteTitle: String(rows[0].siteTitle ?? ''),
         siteDescription: String(rows[0].siteDescription ?? ''),
         siteLogoUrl: String(rows[0].siteLogoUrl ?? ''),
+        telegramGroupLink: String(rows[0].telegramGroupLink ?? ''),
         updatedAt: rows[0].updatedAt ?? null,
       },
     })
@@ -10835,15 +10814,17 @@ app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
 })
 
 app.post('/api/admin/site-settings', requireMaxAdmin, async (req, res) => {
-  const { siteTitle, siteDescription, siteLogoUrl } = req.body as {
+  const { siteTitle, siteDescription, siteLogoUrl, telegramGroupLink } = req.body as {
     siteTitle?: string
     siteDescription?: string
     siteLogoUrl?: string
+    telegramGroupLink?: string
   }
 
   const parsedSiteTitle = String(siteTitle ?? '').trim()
   const parsedSiteDescription = String(siteDescription ?? '').trim()
   const parsedSiteLogoUrl = String(siteLogoUrl ?? '').trim()
+  const parsedTelegramGroupLink = String(telegramGroupLink ?? '').trim()
 
   if (!parsedSiteTitle) {
     res.status(400).json({ ok: false, error: 'Título do site é obrigatório.' })
@@ -10851,66 +10832,28 @@ app.post('/api/admin/site-settings', requireMaxAdmin, async (req, res) => {
   }
 
   try {
-    await pool.query(
-      `
-      CREATE TABLE IF NOT EXISTS site_settings (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-        site_title VARCHAR(150) NOT NULL DEFAULT '',
-        site_description TEXT NULL,
-        site_logo_url VARCHAR(500) NULL,
-        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id)
-      )
-      `
-    )
+    await pool.query(`CREATE TABLE IF NOT EXISTS site_settings (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, site_title VARCHAR(150) NOT NULL DEFAULT '', site_description TEXT NULL, site_logo_url VARCHAR(500) NULL, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (id))`)
+    try { await pool.query(`ALTER TABLE site_settings ADD COLUMN site_logo_url VARCHAR(500) NULL`) } catch { /* já existe */ }
+    try { await pool.query(`ALTER TABLE site_settings ADD COLUMN telegram_group_link VARCHAR(500) NULL`) } catch { /* já existe */ }
 
-    try {
-      await pool.query(
-        `
-        ALTER TABLE site_settings
-        ADD COLUMN site_logo_url VARCHAR(500) NULL
-        `
-      )
-    } catch {
-      // coluna já existe
-    }
-
-    const [rows] = await pool.query<RowDataPacket[]>(
-      'SELECT id FROM site_settings ORDER BY id ASC LIMIT 1'
-    )
+    const [rows] = await pool.query<RowDataPacket[]>('SELECT id FROM site_settings ORDER BY id ASC LIMIT 1')
 
     if (rows.length === 0) {
       await pool.query(
-        `
-        INSERT INTO site_settings (site_title, site_description, site_logo_url)
-        VALUES (?, ?, ?)
-        `,
-        [parsedSiteTitle, parsedSiteDescription, parsedSiteLogoUrl]
+        `INSERT INTO site_settings (site_title, site_description, site_logo_url, telegram_group_link) VALUES (?, ?, ?, ?)`,
+        [parsedSiteTitle, parsedSiteDescription, parsedSiteLogoUrl, parsedTelegramGroupLink]
       )
     } else {
       await pool.query(
-        `
-        UPDATE site_settings
-        SET
-          site_title = ?,
-          site_description = ?,
-          site_logo_url = ?,
-          updated_at = NOW()
-        WHERE id = ?
-        `,
-        [parsedSiteTitle, parsedSiteDescription, parsedSiteLogoUrl, Number(rows[0].id)]
+        `UPDATE site_settings SET site_title=?, site_description=?, site_logo_url=?, telegram_group_link=?, updated_at=NOW() WHERE id=?`,
+        [parsedSiteTitle, parsedSiteDescription, parsedSiteLogoUrl, parsedTelegramGroupLink, Number(rows[0].id)]
       )
     }
 
     res.json({
       ok: true,
       message: 'Configurações do site salvas com sucesso.',
-      settings: {
-        siteTitle: parsedSiteTitle,
-        siteDescription: parsedSiteDescription,
-        siteLogoUrl: parsedSiteLogoUrl,
-      },
+      settings: { siteTitle: parsedSiteTitle, siteDescription: parsedSiteDescription, siteLogoUrl: parsedSiteLogoUrl, telegramGroupLink: parsedTelegramGroupLink },
     })
   } catch (err) {
     console.error('[admin-site-settings-save]', err)
