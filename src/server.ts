@@ -13830,8 +13830,9 @@ app.post('/api/shop/purchase', requireAuth, async (req: AuthenticatedRequest, re
     referenceId?: string
   }
 
-  const parsedUserId = Number(userId)
-  const parsedAmount = Number(String(amount ?? '0').replace(',', '.'))
+  const parsedUserId  = Number(userId)
+  const parsedAmount  = Number(String(amount ?? '0').replace(',', '.'))
+  const parsedProdId  = referenceId ? Number(referenceId) : 0
 
   if (!parsedUserId || Number.isNaN(parsedUserId)) {
     res.status(400).json({ ok: false, error: 'userId inválido.' })
@@ -13850,6 +13851,7 @@ app.post('/api/shop/purchase', requireAuth, async (req: AuthenticatedRequest, re
   try {
     await conn.beginTransaction()
 
+    // 1. Verifica saldo do usuário
     const [userRows] = await conn.query<RowDataPacket[]>(
       'SELECT id, shop_balance AS shopBalance FROM users WHERE id = ? LIMIT 1 FOR UPDATE',
       [parsedUserId]
@@ -13870,13 +13872,51 @@ app.post('/api/shop/purchase', requireAuth, async (req: AuthenticatedRequest, re
       return
     }
 
-    const newBalance = oldBalance - parsedAmount
+    // 2. Busca produto e dados para o gift card
+    let prodImageUrl: string | null = null
+    let prodPlatform: string | null = null
+    if (parsedProdId > 0) {
+      const [prodRows] = await conn.query<RowDataPacket[]>(
+        'SELECT image_url, platform FROM shop_products WHERE id = ? LIMIT 1',
+        [parsedProdId]
+      )
+      if (prodRows.length > 0) {
+        prodImageUrl = prodRows[0].image_url ?? null
+        prodPlatform = prodRows[0].platform ?? null
+      }
+    }
 
+    // 3. Tenta reservar um código do estoque (se houver)
+    let deliveredCode: string | null = null
+    let codeId: number | null = null
+    if (parsedProdId > 0) {
+      const [codeRows] = await conn.query<RowDataPacket[]>(
+        `SELECT id, code FROM shop_product_codes
+         WHERE product_id = ? AND status = 'available'
+         ORDER BY id ASC LIMIT 1 FOR UPDATE`,
+        [parsedProdId]
+      )
+      if (codeRows.length > 0) {
+        deliveredCode = String(codeRows[0].code)
+        codeId        = Number(codeRows[0].id)
+        // Marca código como usado
+        await conn.query(
+          `UPDATE shop_product_codes
+           SET status = 'used', used_by = ?, used_at = NOW()
+           WHERE id = ?`,
+          [parsedUserId, codeId]
+        )
+      }
+    }
+
+    // 4. Debita saldo
+    const newBalance = oldBalance - parsedAmount
     await conn.query(
       'UPDATE users SET shop_balance = ? WHERE id = ?',
       [newBalance, parsedUserId]
     )
 
+    // 5. Registra transação
     await conn.query(
       `INSERT INTO shop_balance_transactions
        (user_id, type, amount, reason, reference_id, old_balance, new_balance, created_by)
@@ -13891,12 +13931,38 @@ app.post('/api/shop/purchase', requireAuth, async (req: AuthenticatedRequest, re
       ]
     )
 
+    // 6. Registra gift card entregue (com ou sem código)
+    let giftCardId: number | null = null
+    try {
+      await ensureGiftCardsTable()
+      const [gcResult] = await conn.query<ResultSetHeader>(
+        `INSERT INTO gift_cards (user_id, name, platform, value, code, image_url)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          parsedUserId,
+          String(productName).trim(),
+          prodPlatform ?? null,
+          parsedAmount,
+          deliveredCode ?? '(código pendente)',
+          prodImageUrl ?? null,
+        ]
+      )
+      giftCardId = gcResult.insertId
+    } catch {
+      // tabela gift_cards pode não existir — não bloqueia a compra
+    }
+
     await conn.commit()
+
     res.json({
-      ok: true,
-      message: 'Compra realizada com sucesso.',
-      shopBalance: newBalance,
-      spent: parsedAmount,
+      ok:           true,
+      message:      deliveredCode
+        ? 'Compra realizada! Seu código foi entregue nos Gift Cards.'
+        : 'Compra realizada! Um código será entregue em breve.',
+      shopBalance:  newBalance,
+      spent:        parsedAmount,
+      code:         deliveredCode,
+      giftCardId,
     })
   } catch (err) {
     await conn.rollback()
@@ -14149,6 +14215,131 @@ app.delete('/api/admin/shop/products/:id', requireMaxAdmin, async (req, res) => 
   } catch (err) {
     console.error('[admin-shop-products-delete]', err)
     res.status(500).json({ ok: false, error: 'Erro ao remover produto.' })
+  }
+})
+
+// ─── ESTOQUE DE CÓDIGOS DOS PRODUTOS DA LOJA ─────────────────────────────────
+
+async function ensureShopProductCodesTable(): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_product_codes (
+      id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      product_id BIGINT UNSIGNED NOT NULL,
+      code       VARCHAR(500) NOT NULL,
+      status     ENUM('available','used') NOT NULL DEFAULT 'available',
+      used_by    BIGINT UNSIGNED NULL,
+      used_at    DATETIME NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_product_status (product_id, status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `)
+}
+ensureShopProductCodesTable().catch(err => console.error('[shop_product_codes table]', err))
+
+// GET /api/admin/shop/products/:id/codes — lista códigos de um produto
+app.get('/api/admin/shop/products/:id/codes', requireMaxAdmin, async (req, res) => {
+  const productId = Number(req.params.id)
+  if (!productId || productId <= 0) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+  try {
+    await ensureShopProductCodesTable()
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, code, status, used_by AS usedBy, used_at AS usedAt, created_at AS createdAt
+       FROM shop_product_codes
+       WHERE product_id = ?
+       ORDER BY id ASC`,
+      [productId]
+    )
+    const available = rows.filter((r) => r.status === 'available').length
+    const used      = rows.filter((r) => r.status === 'used').length
+    res.json({ ok: true, codes: rows, available, used, total: rows.length })
+  } catch (err) {
+    console.error('[shop-product-codes-get]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar códigos.' })
+  }
+})
+
+// POST /api/admin/shop/products/:id/codes — adiciona códigos ao estoque
+app.post('/api/admin/shop/products/:id/codes', requireMaxAdmin, async (req, res) => {
+  const productId = Number(req.params.id)
+  if (!productId || productId <= 0) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+  const { codes } = req.body as { codes?: string | string[] }
+  // aceita string com um código ou array de strings
+  const rawList: string[] = Array.isArray(codes)
+    ? codes
+    : String(codes ?? '').split('\n')
+  const codeList = rawList.map((c) => c.trim()).filter((c) => c.length > 0)
+  if (codeList.length === 0) {
+    res.status(400).json({ ok: false, error: 'Nenhum código válido fornecido.' })
+    return
+  }
+  try {
+    await ensureShopProductCodesTable()
+    // Verifica se produto existe
+    const [prod] = await pool.query<RowDataPacket[]>(
+      'SELECT id FROM shop_products WHERE id = ? LIMIT 1', [productId]
+    )
+    if (prod.length === 0) {
+      res.status(404).json({ ok: false, error: 'Produto não encontrado.' })
+      return
+    }
+    // Insere todos os códigos
+    const values = codeList.map((c) => [productId, c])
+    await pool.query(
+      'INSERT INTO shop_product_codes (product_id, code) VALUES ?',
+      [values]
+    )
+    res.status(201).json({ ok: true, added: codeList.length })
+  } catch (err) {
+    console.error('[shop-product-codes-post]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao adicionar códigos.' })
+  }
+})
+
+// DELETE /api/admin/shop/products/codes/:codeId — remove um código
+app.delete('/api/admin/shop/products/codes/:codeId', requireMaxAdmin, async (req, res) => {
+  const codeId = Number(req.params.codeId)
+  if (!codeId || codeId <= 0) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+  try {
+    await ensureShopProductCodesTable()
+    await pool.query('DELETE FROM shop_product_codes WHERE id = ? AND status = "available"', [codeId])
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('[shop-product-codes-delete]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao remover código.' })
+  }
+})
+
+// GET /api/admin/shop/products/:id/codes/count — conta disponíveis (para exibir no formulário)
+app.get('/api/admin/shop/products/:id/codes/count', requireMaxAdmin, async (req, res) => {
+  const productId = Number(req.params.id)
+  if (!productId || productId <= 0) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+  try {
+    await ensureShopProductCodesTable()
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT
+        COUNT(*) AS total,
+        SUM(status = 'available') AS available,
+        SUM(status = 'used') AS used
+       FROM shop_product_codes WHERE product_id = ?`,
+      [productId]
+    )
+    const r = rows[0]
+    res.json({ ok: true, total: Number(r.total), available: Number(r.available ?? 0), used: Number(r.used ?? 0) })
+  } catch (err) {
+    console.error('[shop-product-codes-count]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao contar códigos.' })
   }
 })
 
