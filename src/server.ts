@@ -2633,13 +2633,19 @@ app.post('/api/CASHIN/', async (req, res) => {
     const user = users[0] as { id: number; name: string; phone: string }
     const amountInCents = Math.round(parsedAmount)
 
+    // Normaliza telefone: remove não-dígitos e o código do país 55 se presente
+    const rawPhone = String(user.phone ?? '').replace(/\D/g, '')
+    const normalizedPhone = rawPhone.startsWith('55') && rawPhone.length > 11
+      ? rawPhone.slice(2)
+      : rawPhone
+
     const payload = {
       amount: amountInCents,
       customerEmail: `user${user.id}@noor661.local`,
       customerName: user.name,
       customerDocument: '11615845445',
       customerDocumentType: 'cpf',
-      customerPhone: user.phone?.replace(/\D/g, '') || '11999998888',
+      customerPhone: normalizedPhone || '11999998888',
       description: `Depósito CASHIN - usuário #${user.id}`,
       callbackUrl: 'https://api.pgl-m.com/api/CASHIN/webhook',
       metadata: {
