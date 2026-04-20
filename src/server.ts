@@ -13880,11 +13880,12 @@ app.get('/api/admin/users/:id/details', requireMaxAdmin, async (req, res) => {
       const [tcRows] = await pool.query<RowDataPacket[]>(
         `
         SELECT
-          telegram_chat_id   AS telegramChatId,
-          telegram_user_id   AS telegramUserId,
-          telegram_username  AS telegramUsername,
+          telegram_chat_id    AS telegramChatId,
+          telegram_user_id    AS telegramUserId,
+          telegram_username   AS telegramUsername,
           telegram_first_name AS telegramFirstName,
-          created_at         AS connectedAt
+          is_connected        AS isConnected,
+          connected_at        AS connectedAt
         FROM user_telegram_connections
         WHERE user_id = ?
         LIMIT 1
