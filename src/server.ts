@@ -10570,6 +10570,9 @@ app.post('/api/admin/deposit-config', requireMaxAdmin, async (req, res) => {
   }
 })
 
+// alias público sem /admin no path
+app.get('/api/withdraw-config', async (_req, res) => res.redirect(307, '/api/admin/withdraw-config'))
+
 app.get('/api/admin/withdraw-config', async (_req, res) => {
   try {
     await pool.query(
