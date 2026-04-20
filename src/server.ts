@@ -9185,6 +9185,11 @@ const ensureGiftCodeTables = async () => {
     ADD COLUMN discount_percent DECIMAL(8,2) NULL
   `)
 
+  await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN product_name VARCHAR(150) NULL
+  `)
+
 }
 
 app.get('/api/gift-vouchers', requireAuth, async (_req, res) => {
@@ -9195,6 +9200,7 @@ app.get('/api/gift-vouchers', requireAuth, async (_req, res) => {
       `
       SELECT
         id,
+        product_name AS productName,
         description,
         image_url AS imageUrl,
         sale_price AS salePrice,
@@ -9229,7 +9235,7 @@ app.get('/api/gift-vouchers', requireAuth, async (_req, res) => {
 
       return {
         id: Number(row.id),
-        name: String(row.description ?? ''),
+        name: String(row.productName ?? row.description ?? ''),
         description: String(row.description ?? ''),
         imageUrl: String(row.imageUrl ?? ''),
         price: finalPrice,
@@ -9703,9 +9709,10 @@ app.post('/api/admin/gift-codes', requireMaxAdmin, async (req: AuthenticatedRequ
         sale_price,
         description,
         discount_coupon,
-        discount_percent
+        discount_percent,
+        product_name
       )
-      VALUES (?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         normalizedCode,
@@ -9722,6 +9729,7 @@ app.post('/api/admin/gift-codes', requireMaxAdmin, async (req: AuthenticatedRequ
         normalizedDescription || null,
         normalizedDiscountCoupon || null,
         normalizedDiscountPercent == null ? null : Number(normalizedDiscountPercent.toFixed(2)),
+        normalizedProductName || null,
       ]
     ) as any
 
