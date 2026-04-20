@@ -9195,11 +9195,9 @@ app.get('/api/gift-vouchers', requireAuth, async (_req, res) => {
       `
       SELECT
         id,
-        code,
         description,
         image_url AS imageUrl,
         sale_price AS salePrice,
-        discount_coupon AS discountCoupon,
         discount_percent AS discountPercent,
         reward_value AS redeemRewardValue,
         max_total_uses AS maxTotalUses,
@@ -9231,13 +9229,11 @@ app.get('/api/gift-vouchers', requireAuth, async (_req, res) => {
 
       return {
         id: Number(row.id),
-        name: String(row.code ?? ''),
-        code: String(row.code ?? ''),
+        name: String(row.description ?? ''),
         description: String(row.description ?? ''),
         imageUrl: String(row.imageUrl ?? ''),
         price: finalPrice,
         originalPrice: salePrice,
-        discountCoupon: String(row.discountCoupon ?? ''),
         discountPercent,
         redeemRewardValue: Number(row.redeemRewardValue ?? 0),
         maxTotalUses: Number(row.maxTotalUses ?? 0),
