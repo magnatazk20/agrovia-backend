@@ -2537,12 +2537,40 @@ app.post('/api/CASHIN/', async (req, res) => {
     return
   }
 
-  if (parsedAmount > 1000) {
-    res.status(400).json({ error: 'Valor máximo para transação: R$ 1000,00' })
-    return
-  }
-
   try {
+    // Busca configuração de depósito do banco
+    const [configRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT min_deposit_amount AS minDepositAmount,
+             max_deposit_amount AS maxDepositAmount,
+             deposit_enabled    AS depositEnabled
+      FROM system_deposit_config
+      ORDER BY id ASC LIMIT 1
+      `
+    )
+
+    const cfg = configRows[0] ?? {}
+    const depositEnabled = Number(cfg.depositEnabled ?? 1) === 1
+    const minDepositAmount = Number(cfg.minDepositAmount ?? 1)
+    const maxDepositAmount = Number(cfg.maxDepositAmount ?? 1000)
+    const effectiveMin = minDepositAmount > 0 ? minDepositAmount : 1
+    const effectiveMax = maxDepositAmount > 0 ? maxDepositAmount : 1000
+
+    if (!depositEnabled) {
+      res.status(400).json({ error: 'Depósitos estão desativados no momento.' })
+      return
+    }
+
+    if (parsedAmount < effectiveMin) {
+      res.status(400).json({ error: `Valor mínimo para depósito é R$ ${effectiveMin.toFixed(2).replace('.', ',')}.` })
+      return
+    }
+
+    if (parsedAmount > effectiveMax) {
+      res.status(400).json({ error: `Valor máximo para depósito é R$ ${effectiveMax.toFixed(2).replace('.', ',')}.` })
+      return
+    }
+
     await settleExpiredCyclesForUser(parsedUserId)
 
     const [users] = await pool.query<RowDataPacket[]>(
@@ -10145,6 +10173,75 @@ app.post('/api/admin/commission-levels', requireMaxAdmin, async (req, res) => {
     res.status(500).json({ ok: false, error: 'Erro ao salvar níveis de comissão.' })
   } finally {
     conn.release()
+  }
+})
+
+// GET /api/deposit-config — endpoint público para o frontend do usuário
+app.get('/api/deposit-config', async (_req, res) => {
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        min_deposit_amount AS minDepositAmount,
+        max_deposit_amount AS maxDepositAmount,
+        deposit_enabled    AS depositEnabled
+      FROM system_deposit_config
+      ORDER BY id ASC
+      LIMIT 1
+      `
+    )
+
+    const [presetRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT value
+      FROM system_deposit_quick_presets
+      WHERE is_active = 1
+      ORDER BY preset_order ASC, id ASC
+      `
+    )
+
+    const quickPresetValues = presetRows
+      .map((row) => Number(row.value ?? 0))
+      .filter((v) => Number.isFinite(v) && v > 0)
+      .map((v) => Number(v.toFixed(2)))
+
+    if (rows.length === 0) {
+      res.json({
+        ok: true,
+        config: {
+          minDepositAmount: 1,
+          maxDepositAmount: 1000,
+          depositEnabled: true,
+          quickPresetValues: quickPresetValues.length > 0 ? quickPresetValues : [20, 50, 100, 200, 500],
+        },
+      })
+      return
+    }
+
+    const row = rows[0]
+    const minDepositAmount = Number(row.minDepositAmount ?? 1)
+    const maxDepositAmount = Number(row.maxDepositAmount ?? 1000)
+
+    res.json({
+      ok: true,
+      config: {
+        minDepositAmount: minDepositAmount > 0 ? minDepositAmount : 1,
+        maxDepositAmount: maxDepositAmount > 0 ? maxDepositAmount : 1000,
+        depositEnabled: Number(row.depositEnabled ?? 1) === 1,
+        quickPresetValues: quickPresetValues.length > 0 ? quickPresetValues : [20, 50, 100, 200, 500],
+      },
+    })
+  } catch (err) {
+    console.error('[deposit-config-public]', err)
+    res.json({
+      ok: true,
+      config: {
+        minDepositAmount: 1,
+        maxDepositAmount: 1000,
+        depositEnabled: true,
+        quickPresetValues: [20, 50, 100, 200, 500],
+      },
+    })
   }
 })
 
