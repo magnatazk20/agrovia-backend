@@ -4177,7 +4177,7 @@ app.get('/api/cycle-products/my-purchases/:userId', requireAuth, async (req: Aut
   }
   try {
     const [rows] = await pool.query<RowDataPacket[]>(
-      `SELECT cycle_product_id AS productId, COUNT(*) AS total FROM cycle_orders WHERE user_id = ? GROUP BY cycle_product_id`,
+      `SELECT cycle_product_id AS productId, COUNT(*) AS total FROM user_cycle_purchases WHERE user_id = ? GROUP BY cycle_product_id`,
       [userId]
     )
     const purchases: Record<number, number> = {}
@@ -5607,7 +5607,7 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
     const maxPerUser = Number(products[0].maxPurchasesPerUser ?? 0)
     if (maxPerUser > 0) {
       const [purchaseCountRows] = await conn.query<RowDataPacket[]>(
-        `SELECT COUNT(*) AS total FROM cycle_orders WHERE user_id = ? AND cycle_product_id = ?`,
+        `SELECT COUNT(*) AS total FROM user_cycle_purchases WHERE user_id = ? AND cycle_product_id = ?`,
         [parsedUserId, parsedCycleProductId]
       )
       const alreadyPurchased = Number(purchaseCountRows[0]?.total ?? 0)
