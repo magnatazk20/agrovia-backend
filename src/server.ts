@@ -12438,14 +12438,33 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
         description: `Saque PIX #${withdrawalId}`,
       }
 
-      const providerRes = await fetch(LUMOPAY_TRANSFER_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': LUMO_API_KEY,
-        },
-        body: JSON.stringify(cashoutPayload),
-      })
+      const lumopayAbort = new AbortController()
+      const lumopayTimeout = setTimeout(() => lumopayAbort.abort(), 30_000)
+
+      let providerRes: Response
+      try {
+        providerRes = await fetch(LUMOPAY_TRANSFER_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': LUMO_API_KEY,
+          },
+          body: JSON.stringify(cashoutPayload),
+          signal: lumopayAbort.signal,
+        })
+      } catch (fetchErr: any) {
+        clearTimeout(lumopayTimeout)
+        await conn.rollback()
+        const isTimeout = fetchErr?.name === 'AbortError'
+        res.status(502).json({
+          ok: false,
+          error: isTimeout
+            ? 'Timeout ao conectar com a Lumopay. Tente novamente.'
+            : `Erro de rede ao contatar Lumopay: ${String(fetchErr?.message ?? fetchErr)}`,
+        })
+        return
+      }
+      clearTimeout(lumopayTimeout)
 
       providerResponsePayload = await providerRes.json().catch(() => ({}))
 
