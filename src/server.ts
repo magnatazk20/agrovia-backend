@@ -12441,9 +12441,9 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
       const lumopayAbort = new AbortController()
       const lumopayTimeout = setTimeout(() => lumopayAbort.abort(), 30_000)
 
-      let providerRes: Response
+      let providerOk = false
       try {
-        providerRes = await fetch(LUMOPAY_TRANSFER_URL, {
+        const fetchRes = await fetch(LUMOPAY_TRANSFER_URL, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -12452,6 +12452,9 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
           body: JSON.stringify(cashoutPayload),
           signal: lumopayAbort.signal,
         })
+        clearTimeout(lumopayTimeout)
+        providerOk = fetchRes.ok
+        providerResponsePayload = await fetchRes.json().catch(() => ({}))
       } catch (fetchErr: any) {
         clearTimeout(lumopayTimeout)
         await conn.rollback()
@@ -12464,11 +12467,8 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
         })
         return
       }
-      clearTimeout(lumopayTimeout)
 
-      providerResponsePayload = await providerRes.json().catch(() => ({}))
-
-      if (!providerRes.ok || providerResponsePayload?.success === false) {
+      if (!providerOk || providerResponsePayload?.success === false) {
         await conn.rollback()
         res.status(502).json({
           ok: false,
