@@ -1382,6 +1382,14 @@ const startTelegramPolling = () => {
 const requireAuth = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   const authUser = await resolveAuthUser(req)
   if (!authUser) {
+    const hasToken = String(req.headers.authorization ?? '').startsWith('Bearer ')
+    void logSecurityEvent({
+      eventType: hasToken ? 'invalid_token' : 'missing_token',
+      req,
+      userId: null,
+      httpStatus: 401,
+      reason: hasToken ? 'Token JWT inválido ou expirado' : 'Requisição sem token JWT',
+    })
     res.status(401).json({ ok: false, error: 'Não autorizado.' })
     return
   }
@@ -1403,6 +1411,72 @@ const requireMaxAdmin = async (req: AuthenticatedRequest, res: Response, next: N
 
   req.authUser = authUser
   next()
+}
+
+// ─── Security Logs ────────────────────────────────────────────────────────────
+const ensureSecurityLogsTable = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS security_logs (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      event_type VARCHAR(60) NOT NULL,
+      ip VARCHAR(80) NOT NULL DEFAULT '',
+      user_agent VARCHAR(500) NULL,
+      user_id BIGINT UNSIGNED NULL,
+      endpoint VARCHAR(255) NOT NULL DEFAULT '',
+      method VARCHAR(10) NOT NULL DEFAULT '',
+      attempted_user_id BIGINT UNSIGNED NULL,
+      http_status SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+      reason VARCHAR(255) NOT NULL DEFAULT '',
+      extra JSON NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_security_logs_event (event_type),
+      KEY idx_security_logs_ip (ip),
+      KEY idx_security_logs_user_id (user_id),
+      KEY idx_security_logs_created_at (created_at)
+    )
+  `)
+}
+
+const logSecurityEvent = async (opts: {
+  eventType: string
+  req: Request
+  userId?: number | null
+  attemptedUserId?: number | null
+  httpStatus: number
+  reason: string
+  extra?: Record<string, unknown>
+}) => {
+  try {
+    await ensureSecurityLogsTable()
+    const ip = String(
+      (opts.req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim() ??
+      opts.req.socket?.remoteAddress ??
+      'unknown'
+    )
+    const userAgent = String(opts.req.headers['user-agent'] ?? '').slice(0, 500)
+    const endpoint = String(opts.req.path ?? '').slice(0, 255)
+    const method = String(opts.req.method ?? '').slice(0, 10)
+    await pool.query(
+      `INSERT INTO security_logs
+        (event_type, ip, user_agent, user_id, endpoint, method, attempted_user_id, http_status, reason, extra)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        opts.eventType,
+        ip,
+        userAgent || null,
+        opts.userId ?? null,
+        endpoint,
+        method,
+        opts.attemptedUserId ?? null,
+        opts.httpStatus,
+        opts.reason,
+        opts.extra ? JSON.stringify(opts.extra) : null,
+      ]
+    )
+  } catch {
+    // silently ignore logging errors
+  }
 }
 
 const settleExpiredCyclesForUser = async (userId: number) => {
@@ -1628,6 +1702,14 @@ const createRateLimiter = (maxRequests: number, windowMs: number, message?: stri
 
     if (entry.count > maxRequests) {
       const retryAfterSec = Math.ceil((entry.resetAt - now) / 1000)
+      void logSecurityEvent({
+        eventType: 'rate_limit_exceeded',
+        req,
+        userId: null,
+        httpStatus: 429,
+        reason: `Rate limit excedido: ${entry.count} req em ${windowMs / 1000}s`,
+        extra: { retryAfterSec, maxRequests, windowMs },
+      })
       res.setHeader('Retry-After', String(retryAfterSec))
       res.status(429).json({
         ok: false,
@@ -2200,6 +2282,7 @@ app.post('/api/roleta/redeem-code', redeemCodeLimiter, requireAuth, async (req: 
 
   // ── Segurança: userId do body deve ser o mesmo do token ──
   if (parsedUserId !== Number(req.authUser?.id ?? 0)) {
+    void logSecurityEvent({ eventType: 'unauthorized_action', req, userId: req.authUser?.id, attemptedUserId: parsedUserId, httpStatus: 403, reason: 'userId do body difere do token JWT', extra: { endpoint: '/api/roleta/redeem-code', code: normalizedCode } })
     res.status(403).json({ ok: false, error: 'Ação não permitida para este usuário.' })
     return
   }
@@ -5081,6 +5164,7 @@ app.post('/api/mining/tasks/complete', requireAuth, async (req: AuthenticatedReq
 
   // ── Segurança: userId do body deve ser o mesmo do token ──
   if (parsedUserId !== Number(req.authUser?.id ?? 0)) {
+    void logSecurityEvent({ eventType: 'unauthorized_action', req, userId: req.authUser?.id, attemptedUserId: parsedUserId, httpStatus: 403, reason: 'userId do body difere do token JWT', extra: { endpoint: '/api/mining/tasks/complete', taskId } })
     res.status(403).json({ ok: false, error: 'Ação não permitida para este usuário.' })
     return
   }
@@ -5982,6 +6066,7 @@ app.post('/api/roleta/spin', spinLimiter, requireAuth, async (req: Authenticated
 
   // ── Segurança: userId do body deve ser o mesmo do token ──
   if (parsedUserId !== Number(req.authUser?.id ?? 0)) {
+    void logSecurityEvent({ eventType: 'unauthorized_action', req, userId: req.authUser?.id, attemptedUserId: parsedUserId, httpStatus: 403, reason: 'userId do body difere do token JWT', extra: { endpoint: '/api/roleta/spin' } })
     res.status(403).json({ ok: false, error: 'Ação não permitida para este usuário.' })
     return
   }
@@ -6733,6 +6818,7 @@ app.post('/api/checkin/claim', requireAuth, async (req: AuthenticatedRequest, re
 
   // ── Segurança: userId do body deve ser o mesmo do token ──
   if (parsedUserId !== Number(req.authUser?.id ?? 0)) {
+    void logSecurityEvent({ eventType: 'unauthorized_action', req, userId: req.authUser?.id, attemptedUserId: parsedUserId, httpStatus: 403, reason: 'userId do body difere do token JWT', extra: { endpoint: '/api/checkin/claim' } })
     res.status(403).json({ ok: false, error: 'Ação não permitida para este usuário.' })
     return
   }
@@ -7568,6 +7654,7 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
 
   // ── Segurança: userId do body deve ser o mesmo do token ──
   if (parsedUserId !== Number(req.authUser?.id ?? 0)) {
+    void logSecurityEvent({ eventType: 'unauthorized_action', req, userId: req.authUser?.id, attemptedUserId: parsedUserId, httpStatus: 403, reason: 'userId do body difere do token JWT', extra: { endpoint: '/api/withdraw/request' } })
     res.status(403).json({ ok: false, error: 'Ação não permitida para este usuário.' })
     return
   }
@@ -9859,6 +9946,7 @@ app.post('/api/gift-codes/redeem', requireAuth, async (req: AuthenticatedRequest
 
   // ── Segurança: userId do body deve ser o mesmo do token ──
   if (parsedUserId !== Number(req.authUser?.id ?? 0)) {
+    void logSecurityEvent({ eventType: 'unauthorized_action', req, userId: req.authUser?.id, attemptedUserId: parsedUserId, httpStatus: 403, reason: 'userId do body difere do token JWT', extra: { endpoint: '/api/gift-codes/redeem', code: normalizedCode } })
     res.status(403).json({ ok: false, error: 'Ação não permitida para este usuário.' })
     return
   }
@@ -13178,6 +13266,79 @@ app.get('/api/admin/logs', requireMaxAdmin, async (req, res) => {
   } catch (err) {
     console.error('[admin-logs-list]', err)
     res.status(500).json({ ok: false, error: 'Falha ao carregar logs administrativos.' })
+  }
+})
+
+// ─── Security Logs endpoint ───────────────────────────────────────────────────
+app.get('/api/admin/security-logs', requireMaxAdmin, async (req, res) => {
+  const rawLimit = Number(req.query.limit ?? 500)
+  const limit = Math.min(Math.max(rawLimit, 1), 2000)
+  const eventTypeFilter = String(req.query.eventType ?? 'all').trim().toLowerCase()
+
+  try {
+    await ensureSecurityLogsTable()
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        sl.id,
+        sl.event_type AS eventType,
+        sl.ip,
+        sl.user_agent AS userAgent,
+        sl.user_id AS userId,
+        sl.endpoint,
+        sl.method,
+        sl.attempted_user_id AS attemptedUserId,
+        sl.http_status AS httpStatus,
+        sl.reason,
+        sl.extra,
+        sl.created_at AS createdAt,
+        u.name AS userName,
+        u.phone AS userPhone,
+        au.name AS attemptedUserName,
+        au.phone AS attemptedUserPhone
+      FROM security_logs sl
+      LEFT JOIN users u ON u.id = sl.user_id
+      LEFT JOIN users au ON au.id = sl.attempted_user_id
+      ORDER BY sl.id DESC
+      LIMIT ?
+      `,
+      [limit]
+    )
+
+    const parseExtra = (value: unknown) => {
+      if (value == null) return null
+      if (typeof value === 'object') return value as Record<string, unknown>
+      try { return JSON.parse(String(value)) as Record<string, unknown> } catch { return { raw: String(value) } }
+    }
+
+    const mapped = rows.map((row) => ({
+      id: Number(row.id),
+      eventType: String(row.eventType ?? ''),
+      ip: String(row.ip ?? ''),
+      userAgent: row.userAgent ? String(row.userAgent) : null,
+      userId: row.userId == null ? null : Number(row.userId),
+      userName: row.userName == null ? null : String(row.userName),
+      userPhone: row.userPhone == null ? null : String(row.userPhone),
+      endpoint: String(row.endpoint ?? ''),
+      method: String(row.method ?? ''),
+      attemptedUserId: row.attemptedUserId == null ? null : Number(row.attemptedUserId),
+      attemptedUserName: row.attemptedUserName == null ? null : String(row.attemptedUserName),
+      attemptedUserPhone: row.attemptedUserPhone == null ? null : String(row.attemptedUserPhone),
+      httpStatus: Number(row.httpStatus ?? 0),
+      reason: String(row.reason ?? ''),
+      extra: parseExtra(row.extra),
+      createdAt: row.createdAt ? String(row.createdAt) : null,
+    }))
+
+    const filtered = eventTypeFilter === 'all'
+      ? mapped
+      : mapped.filter((r) => r.eventType === eventTypeFilter)
+
+    res.json({ ok: true, total: filtered.length, logs: filtered })
+  } catch (err) {
+    console.error('[admin-security-logs]', err)
+    res.status(500).json({ ok: false, error: 'Falha ao carregar logs de segurança.' })
   }
 })
 
