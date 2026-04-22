@@ -1555,8 +1555,8 @@ const settleExpiredCyclesForUser = async (userId: number) => {
       if (capital > 0) totalCapitalReturn += capital
     }
 
-    // Total a creditar = lucro + devolução do capital investido
-    const totalCredit = Number((totalProfit + totalCapitalReturn).toFixed(2))
+    // Total a creditar = apenas o lucro (capital investido não é devolvido)
+    const totalCredit = Number(totalProfit.toFixed(2))
 
     const oldBalance = Number(userRows[0].balance ?? 0)
 
