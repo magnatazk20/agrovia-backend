@@ -13186,6 +13186,38 @@ app.post('/api/admin/users/:id/telegram/message', requireMaxAdmin, async (req, r
   }
 })
 
+// ─── Deletar senha de saque do usuário ───────────────────────────────────────
+app.delete('/api/admin/users/:id/withdraw-password', requireMaxAdmin, async (req, res) => {
+  const userId = Number(req.params.id)
+
+  if (!userId || Number.isNaN(userId)) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+
+  try {
+    const [userRows] = await pool.query<RowDataPacket[]>(
+      `SELECT id FROM users WHERE id = ? LIMIT 1`,
+      [userId]
+    )
+
+    if (userRows.length === 0) {
+      res.status(404).json({ ok: false, error: 'Usuário não encontrado.' })
+      return
+    }
+
+    await pool.query(
+      `UPDATE users SET withdraw_password = NULL WHERE id = ?`,
+      [userId]
+    )
+
+    res.json({ ok: true, message: 'Senha de saque removida com sucesso.' })
+  } catch (err) {
+    console.error('[admin-delete-withdraw-password]', err)
+    res.status(500).json({ ok: false, error: 'Falha ao remover senha de saque.' })
+  }
+})
+
 app.post('/api/admin/users/:id/balance', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
   const userId = Number(req.params.id)
   const { amount, operation, reason } = (req.body ?? {}) as {
@@ -14347,6 +14379,19 @@ app.get('/api/admin/users/:id/details', requireMaxAdmin, async (req, res) => {
     }
 
     const user = userRows[0]
+
+    // ── Verificar se usuário tem senha de saque cadastrada ────────────────────
+    let hasWithdrawPassword = false
+    try {
+      const [wpRows] = await pool.query<RowDataPacket[]>(
+        `SELECT withdraw_password FROM users WHERE id = ? LIMIT 1`,
+        [userId]
+      )
+      hasWithdrawPassword = Boolean(String(wpRows[0]?.withdraw_password ?? '').trim())
+    } catch {
+      hasWithdrawPassword = false
+    }
+
     // Buscar dados da conexão Telegram
     let telegramConnection: {
       telegramChatId: string
@@ -14398,6 +14443,7 @@ app.get('/api/admin/users/:id/details', requireMaxAdmin, async (req, res) => {
         shopBalance: Number(user.shopBalance ?? 0),
         telegramConectado: Number(user.telegramConectado ?? 0),
         telegramConnection,
+        hasWithdrawPassword,
         activeContract: user.activeContract == null ? null : String(user.activeContract),
         totalDepositsPaid: Number(depositRows[0]?.total ?? 0),
         totalWithdrawals,
