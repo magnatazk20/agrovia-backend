@@ -13131,6 +13131,61 @@ app.delete('/api/admin/users/:id/telegram', requireMaxAdmin, async (req, res) =>
   }
 })
 
+// ─── Enviar mensagem Telegram para usuário via bot ───────────────────────────
+app.post('/api/admin/users/:id/telegram/message', requireMaxAdmin, async (req, res) => {
+  const userId = Number(req.params.id)
+  const { message } = (req.body ?? {}) as { message?: string }
+
+  if (!userId || Number.isNaN(userId)) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+
+  const text = String(message ?? '').trim()
+  if (!text) {
+    res.status(400).json({ ok: false, error: 'Mensagem não pode ser vazia.' })
+    return
+  }
+
+  try {
+    // Busca o chat_id do usuário
+    const [connRows] = await pool.query<RowDataPacket[]>(
+      `SELECT telegram_chat_id FROM user_telegram_connections WHERE user_id = ? LIMIT 1`,
+      [userId]
+    )
+
+    if (connRows.length === 0) {
+      res.status(404).json({ ok: false, error: 'Usuário não possui Telegram conectado.' })
+      return
+    }
+
+    const chatId = String(connRows[0].telegram_chat_id ?? '')
+    if (!chatId) {
+      res.status(404).json({ ok: false, error: 'Chat ID do Telegram não encontrado.' })
+      return
+    }
+
+    // Busca o bot token configurado
+    const [configRows] = await pool.query<RowDataPacket[]>(
+      `SELECT bot_token AS botToken FROM system_telegram_config LIMIT 1`
+    )
+
+    if (configRows.length === 0 || !configRows[0].botToken) {
+      res.status(500).json({ ok: false, error: 'Bot Telegram não configurado no sistema.' })
+      return
+    }
+
+    const botToken = String(configRows[0].botToken)
+
+    await sendTelegramMessage(botToken, chatId, text)
+
+    res.json({ ok: true, message: 'Mensagem enviada com sucesso via Telegram.' })
+  } catch (err) {
+    console.error('[admin-telegram-send-message]', err)
+    res.status(500).json({ ok: false, error: 'Falha ao enviar mensagem pelo Telegram.' })
+  }
+})
+
 app.post('/api/admin/users/:id/balance', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
   const userId = Number(req.params.id)
   const { amount, operation, reason } = (req.body ?? {}) as {
