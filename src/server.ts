@@ -4,6 +4,8 @@ import dotenv from 'dotenv'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
+import fs from 'fs'
+import path from 'path'
 import { createServer } from 'http'
 import { Server as SocketIOServer } from 'socket.io'
 import pool, { DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER } from './db'
@@ -634,10 +636,12 @@ const claimCheckinForUser = async (userId: number) => {
     await conn.query(
       `
       UPDATE users
-      SET balance = COALESCE(balance, 0) + ?
+      SET
+        balance = COALESCE(balance, 0) + ?,
+        commission_balance = COALESCE(commission_balance, 0) + ?
       WHERE id = ?
       `,
-      [rewardAmount, parsedUserId]
+      [rewardAmount, rewardAmount, parsedUserId]
     )
 
     const [updatedRows] = await conn.query<RowDataPacket[]>(
@@ -1564,10 +1568,12 @@ const settleExpiredCyclesForUser = async (userId: number) => {
       await conn.query(
         `
         UPDATE users
-        SET balance = COALESCE(balance, 0) + ?
+        SET
+          balance = COALESCE(balance, 0) + ?,
+          commission_balance = COALESCE(commission_balance, 0) + ?
         WHERE id = ?
         `,
-        [totalCredit, userId]
+        [totalCredit, totalCredit, userId]
       )
     }
 
@@ -1664,7 +1670,12 @@ const settleExpiredCyclesForUser = async (userId: number) => {
 }
 
 app.use(cors())
-app.use(express.json())
+app.use(express.json({ limit: '10mb' }))
+
+// ─── Servir uploads estáticos ─────────────────────────────────────────────
+const UPLOADS_DIR = path.resolve(__dirname, '..', 'uploads')
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true })
+app.use('/uploads', express.static(UPLOADS_DIR))
 
 // ─── Log de todas as requisições HTTP ────────────────────────────────────────
 app.use((req, res, next) => {
@@ -1789,6 +1800,20 @@ setInterval(() => {
   if (changed) broadcastOnlineCount()
 }, 30_000)
 
+// Job global: a cada 60s, marca como 'inactive' qualquer user_vip cujo expires_at já passou.
+// Isso garante que o VIP do usuário expire mesmo sem ele acessar a plataforma.
+setInterval(async () => {
+  try {
+    await pool.query(
+      `UPDATE user_vips
+       SET status = 'inactive'
+       WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <= NOW()`
+    )
+  } catch (err) {
+    console.error('[vip-expire-job]', err)
+  }
+}, 60_000)
+
 // POST /api/presence/heartbeat — chamado pelo frontend a cada 30s
 app.post('/api/presence/heartbeat', (req, res) => {
   const userId = String(req.body?.userId ?? '').trim()
@@ -1895,6 +1920,44 @@ app.get('/api/referral/commission-levels', async (_req, res) => {
   }
 })
 
+const migrateVipLevelsRewardColumn = async () => {
+  try {
+    const [cols] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'vip_levels'
+        AND COLUMN_NAME IN ('task_reward_multiplier', 'task_reward_amount')
+      `
+    )
+    const names = cols.map((c: any) => String(c.COLUMN_NAME))
+    const hasOld = names.includes('task_reward_multiplier')
+    const hasNew = names.includes('task_reward_amount')
+
+    if (hasOld && !hasNew) {
+      await pool.query(
+        `ALTER TABLE vip_levels CHANGE COLUMN task_reward_multiplier task_reward_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00`
+      )
+      console.log('[migrate] vip_levels: task_reward_multiplier -> task_reward_amount')
+    } else if (hasOld && hasNew) {
+      // Caso exista os dois (migração parcial anterior), copia dados e remove a antiga
+      await pool.query(
+        `UPDATE vip_levels SET task_reward_amount = task_reward_multiplier WHERE task_reward_amount = 0`
+      )
+      await pool.query(`ALTER TABLE vip_levels DROP COLUMN task_reward_multiplier`)
+      console.log('[migrate] vip_levels: coluna antiga removida')
+    } else if (!hasNew) {
+      await pool.query(
+        `ALTER TABLE vip_levels ADD COLUMN task_reward_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00`
+      )
+      console.log('[migrate] vip_levels: task_reward_amount adicionada')
+    }
+  } catch (err) {
+    console.error('[migrate-vip-reward-column]', err)
+  }
+}
+
 const bootstrapDatabase = async () => {
   await ensureDatabaseExists()
   await ensureTelegramConfigTable()
@@ -1953,12 +2016,64 @@ const bootstrapDatabase = async () => {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `)
 
+  // Garante colunas das carteiras (recharge_balance e commission_balance) em users
+  try {
+    const [rechargeCols] = await pool.query<RowDataPacket[]>(
+      "SHOW COLUMNS FROM users LIKE 'recharge_balance'"
+    )
+    if (rechargeCols.length === 0) {
+      await pool.query(
+        'ALTER TABLE users ADD COLUMN recharge_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00'
+      )
+      await pool.query(
+        'UPDATE users SET recharge_balance = COALESCE(total_deposits, 0) WHERE recharge_balance = 0'
+      )
+      console.log('[bootstrap-database] recharge_balance column added')
+    }
+
+    const [commissionCols] = await pool.query<RowDataPacket[]>(
+      "SHOW COLUMNS FROM users LIKE 'commission_balance'"
+    )
+    if (commissionCols.length === 0) {
+      await pool.query(
+        'ALTER TABLE users ADD COLUMN commission_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00'
+      )
+      await pool.query(
+        'UPDATE users SET commission_balance = GREATEST(COALESCE(balance, 0) - COALESCE(total_deposits, 0), 0) WHERE commission_balance = 0'
+      )
+      console.log('[bootstrap-database] commission_balance column added')
+    }
+  } catch (err) {
+    console.error('[bootstrap-database] wallets migration error', err)
+  }
+
+  // ── Tabela de estornos VIP pendentes ────────────────────────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS vip_refunds (
+      id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id          BIGINT UNSIGNED NOT NULL,
+      old_vip_level_id BIGINT UNSIGNED NOT NULL COMMENT 'plano antigo que foi substituído',
+      new_vip_level_id BIGINT UNSIGNED NOT NULL COMMENT 'plano novo que o usuário comprou',
+      refund_amount    DECIMAL(12,2)   NOT NULL COMMENT 'valor do plano antigo a ser estornado',
+      status           VARCHAR(30)     NOT NULL DEFAULT 'pending' COMMENT 'pending | approved | rejected',
+      admin_note       TEXT            NULL,
+      reviewed_by      BIGINT UNSIGNED NULL COMMENT 'admin que revisou',
+      reviewed_at      DATETIME        NULL,
+      created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_vr_user   (user_id),
+      KEY idx_vr_status (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `)
+
   console.log('[bootstrap-database] telegram config e conexões garantidas')
   console.log('[bootstrap-database] withdraw_activation_tokens table ensured')
   console.log('[bootstrap-database] commission_levels table ensured')
   console.log('[bootstrap-database] vip/mining tables ensured')
   console.log('[bootstrap-database] shop_balance e shop_balance_transactions garantidos')
   console.log('[bootstrap-database] shop_deposits garantida')
+  console.log('[bootstrap-database] wallets (recharge/commission) ensured')
+  console.log('[bootstrap-database] vip_refunds table ensured')
 }
 
 bootstrapDatabase().catch((err) => {
@@ -2520,13 +2635,72 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       }
     }
 
-    // Inserir usuário com referral próprio
+    // Garante coluna badge antes do insert (idempotente)
+    await pool
+      .query("ALTER TABLE users ADD COLUMN badge VARCHAR(50) NOT NULL DEFAULT 'Estagiário'")
+      .catch(() => null)
+
+    // Inserir usuário com referral próprio e badge inicial "Estagiário"
     const [result] = await pool.query(
-      'INSERT INTO users (name, phone, password, referral_code, referred_by_user_id) VALUES (?, ?, ?, ?, ?)',
-      [name, normalizedPhone, hash, userReferralCode, referredByUserId]
+      'INSERT INTO users (name, phone, password, referral_code, referred_by_user_id, badge) VALUES (?, ?, ?, ?, ?, ?)',
+      [name, normalizedPhone, hash, userReferralCode, referredByUserId, 'Estagiário']
     ) as any
 
     const userId = result.insertId
+
+    // ── Concede automaticamente o VIP padrão (configurado no admin) ao novo usuário ──
+    // O VIP padrão é definido pela coluna `is_default = 1` em vip_levels.
+    // Fallback: se nenhum VIP estiver marcado como padrão, tenta o id=6 (T0 - Estágio).
+    try {
+      const [defaultVipRows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, duration_days AS durationDays
+         FROM vip_levels
+         WHERE is_default = 1 AND is_active = 1
+         ORDER BY id ASC
+         LIMIT 1`
+      )
+
+      let defaultVipId: number | null = null
+      let defaultVipDuration = 0 // 0 = sem expiração
+
+      if (defaultVipRows.length > 0) {
+        defaultVipId = Number(defaultVipRows[0].id)
+        defaultVipDuration = Number(defaultVipRows[0].durationDays ?? 0)
+      } else {
+        // Fallback: procurar id=6 (compatibilidade)
+        const [fallbackRows] = await pool.query<RowDataPacket[]>(
+          `SELECT id, duration_days AS durationDays FROM vip_levels WHERE id = 6 AND is_active = 1 LIMIT 1`
+        )
+        if (fallbackRows.length > 0) {
+          defaultVipId = Number(fallbackRows[0].id)
+          defaultVipDuration = Number(fallbackRows[0].durationDays ?? 0)
+        }
+      }
+
+      if (defaultVipId !== null) {
+        // Se o VIP padrão for gratuito (preço = 0), usar expiração NULL (vitalício),
+        // caso contrário usar a duration_days do plano.
+        if (defaultVipDuration > 0) {
+          await pool.query(
+            `INSERT INTO user_vips
+             (user_id, vip_level_id, status, started_at, expires_at)
+             VALUES (?, ?, 'active', NOW(), DATE_ADD(NOW(), INTERVAL ? DAY))`,
+            [userId, defaultVipId, defaultVipDuration]
+          )
+        } else {
+          await pool.query(
+            `INSERT INTO user_vips
+             (user_id, vip_level_id, status, started_at, expires_at)
+             VALUES (?, ?, 'active', NOW(), NULL)`,
+            [userId, defaultVipId]
+          )
+        }
+      } else {
+        console.warn('[register] Nenhum VIP padrão configurado e id=6 não encontrado. Pulando atribuição automática.')
+      }
+    } catch (vipErr) {
+      console.error('[register-default-vip]', vipErr)
+    }
 
     // Giro da roleta NÃO é concedido no cadastro.
     // O giro só é concedido quando o indicado (nível 1) fizer o primeiro depósito.
@@ -2615,8 +2789,29 @@ app.get('/api/user/summary/:id', async (req, res) => {
       // coluna já existe
     }
 
+    // Garante coluna badge (idempotente)
+    await pool
+      .query("ALTER TABLE users ADD COLUMN badge VARCHAR(50) NOT NULL DEFAULT 'Estagiário'")
+      .catch(() => null)
+
+    // Garante colunas das carteiras (idempotente)
+    await pool
+      .query('ALTER TABLE users ADD COLUMN recharge_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00')
+      .catch(() => null)
+    await pool
+      .query('ALTER TABLE users ADD COLUMN commission_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00')
+      .catch(() => null)
+
     const [rows] = await pool.query<RowDataPacket[]>(
-      'SELECT balance, shop_balance, total_deposits, monthly_salary_contract AS monthlySalaryContract FROM users WHERE id = ?',
+      `SELECT
+         balance,
+         shop_balance,
+         total_deposits,
+         monthly_salary_contract AS monthlySalaryContract,
+         badge,
+         recharge_balance   AS rechargeBalance,
+         commission_balance AS commissionBalance
+       FROM users WHERE id = ?`,
       [userId]
     )
 
@@ -2630,13 +2825,19 @@ app.get('/api/user/summary/:id', async (req, res) => {
       shop_balance: number | string
       total_deposits: number | string
       monthlySalaryContract?: string | null
+      badge?: string | null
+      rechargeBalance?: number | string
+      commissionBalance?: number | string
     }
 
     res.json({
       balance: Number(row.balance ?? 0),
       shopBalance: Number(row.shop_balance ?? 0),
       totalDeposits: Number(row.total_deposits ?? 0),
+      rechargeBalance: Number(row.rechargeBalance ?? 0),
+      commissionBalance: Number(row.commissionBalance ?? 0),
       monthlySalaryContract: row.monthlySalaryContract == null ? null : String(row.monthlySalaryContract),
+      badge: row.badge == null || String(row.badge).trim() === '' ? 'Estagiário' : String(row.badge),
     })
   } catch (err) {
     console.error('[user-summary]', err)
@@ -2959,10 +3160,11 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
             UPDATE users
             SET
               balance = COALESCE(balance, 0) + ?,
+              recharge_balance = COALESCE(recharge_balance, 0) + ?,
               total_deposits = COALESCE(total_deposits, 0) + ?
             WHERE id = ?
             `,
-            [Number(existing.amount ?? amountBRL), Number(existing.amount ?? amountBRL), existing.user_id]
+            [Number(existing.amount ?? amountBRL), Number(existing.amount ?? amountBRL), Number(existing.amount ?? amountBRL), existing.user_id]
           )
 
           const [depositorRows] = await pool.query<RowDataPacket[]>(
@@ -3022,11 +3224,10 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
             )
           }
 
-          await applyReferralCommissionsForDeposit(
-            Number(existing.id),
-            Number(existing.user_id),
-            Number(existing.amount ?? amountBRL)
-          )
+          // Comissão por depósito removida – comissão agora é por compra de VIP
+
+          // Emite saldo atualizado via WebSocket
+          emitBalanceUpdate(Number(existing.user_id))
         }
 
         res.status(200).send('OK')
@@ -3066,10 +3267,11 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           UPDATE users
           SET
             balance = COALESCE(balance, 0) + ?,
+            recharge_balance = COALESCE(recharge_balance, 0) + ?,
             total_deposits = COALESCE(total_deposits, 0) + ?
           WHERE id = ?
           `,
-          [amountBRL, amountBRL, userId]
+          [amountBRL, amountBRL, amountBRL, userId]
         )
 
         const [depositorRows] = await pool.query<RowDataPacket[]>(
@@ -3139,13 +3341,10 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           [providerTransactionId ? String(providerTransactionId) : '']
         )
 
-        if (createdRows.length > 0) {
-          await applyReferralCommissionsForDeposit(
-            Number(createdRows[0].id),
-            userId,
-            amountBRL
-          )
-        }
+        // Comissão por depósito removida – comissão agora é por compra de VIP
+
+        // Emite saldo atualizado via WebSocket
+        emitBalanceUpdate(userId)
       }
     }
 
@@ -4123,7 +4322,10 @@ app.get('/api/dashboard/cycle-products', async (_req, res) => {
         require_commission_level_1_count AS requireCommissionLevel1Count,
         require_commission_level_2_count AS requireCommissionLevel2Count,
         require_commission_level_3_count AS requireCommissionLevel3Count,
-        COALESCE(max_purchases_per_user, 0) AS maxPurchasesPerUser
+        COALESCE(max_purchases_per_user, 0) AS maxPurchasesPerUser,
+        COALESCE(min_amount, 0) AS minAmount,
+        COALESCE(max_amount, 0) AS maxAmount,
+        COALESCE(profit_percent, 0) AS profitPercent
       FROM cycle_products
       WHERE is_active = 1
       ORDER BY sort_order ASC, id ASC
@@ -4154,6 +4356,9 @@ app.get('/api/dashboard/cycle-products', async (_req, res) => {
         requireCommissionLevel2Count: Number(row.requireCommissionLevel2Count ?? 0),
         requireCommissionLevel3Count: Number(row.requireCommissionLevel3Count ?? 0),
         maxPurchasesPerUser: Number(row.maxPurchasesPerUser ?? 0),
+        minAmount: Number(row.minAmount ?? 0),
+        maxAmount: Number(row.maxAmount ?? 0),
+        profitPercent: Number(row.profitPercent ?? 0),
       }
     })
 
@@ -4214,6 +4419,9 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
         require_commission_level_2_count AS requireCommissionLevel2Count,
         require_commission_level_3_count AS requireCommissionLevel3Count,
         COALESCE(max_purchases_per_user, 0) AS maxPurchasesPerUser,
+        COALESCE(min_amount, 0) AS minAmount,
+        COALESCE(max_amount, 0) AS maxAmount,
+        COALESCE(profit_percent, 0) AS profitPercent,
         created_at AS createdAt
       FROM cycle_products
       ORDER BY sort_order ASC, id ASC
@@ -4237,6 +4445,9 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
       requireCommissionLevel2Count: Number(row.requireCommissionLevel2Count ?? 0),
       requireCommissionLevel3Count: Number(row.requireCommissionLevel3Count ?? 0),
       maxPurchasesPerUser: Number(row.maxPurchasesPerUser ?? 0),
+      minAmount: Number(row.minAmount ?? 0),
+      maxAmount: Number(row.maxAmount ?? 0),
+      profitPercent: Number(row.profitPercent ?? 0),
       createdAt: row.createdAt ?? null,
     }))
 
@@ -4252,7 +4463,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
     name, description, imageUrl, price, redeemRewardValue, isActive,
     cycleDays, sortOrder, planType, stockQuantity, expiresAt,
     requireCommissionLevel1Count, requireCommissionLevel2Count, requireCommissionLevel3Count,
-    maxPurchasesPerUser,
+    maxPurchasesPerUser, minAmount, maxAmount, profitPercent,
   } = req.body as {
     name?: string
     description?: string
@@ -4269,6 +4480,9 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
     requireCommissionLevel2Count?: number | string
     requireCommissionLevel3Count?: number | string
     maxPurchasesPerUser?: number | string
+    minAmount?: number | string
+    maxAmount?: number | string
+    profitPercent?: number | string
   }
 
   const parsedName = String(name ?? '').trim()
@@ -4291,13 +4505,16 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
   const parsedLevel3 = Math.max(0, Number(String(requireCommissionLevel3Count ?? 0)))
   const parsedExpiresAt = parsedPlanType === 'vip_day' && expiresAt ? String(expiresAt) : null
   const parsedMaxPurchasesPerUser = Math.max(0, Number(String(maxPurchasesPerUser ?? 0)))
+  const parsedMinAmount = Math.max(0, Number(String(minAmount ?? 0).replace(',', '.')))
+  const parsedMaxAmount = Math.max(0, Number(String(maxAmount ?? 0).replace(',', '.')))
+  const parsedProfitPercent = Math.max(0, Number(String(profitPercent ?? 0).replace(',', '.')))
 
   if (!parsedName) {
     res.status(400).json({ ok: false, error: 'Nome do produto é obrigatório.' })
     return
   }
 
-  if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
+  if (!Number.isFinite(parsedPrice) || parsedPrice < 0) {
     res.status(400).json({ ok: false, error: 'Preço inválido.' })
     return
   }
@@ -4333,9 +4550,12 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         require_commission_level_1_count,
         require_commission_level_2_count,
         require_commission_level_3_count,
-        max_purchases_per_user
+        max_purchases_per_user,
+        min_amount,
+        max_amount,
+        profit_percent
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         parsedName,
@@ -4353,6 +4573,9 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         parsedLevel2,
         parsedLevel3,
         parsedMaxPurchasesPerUser,
+        Number.isFinite(parsedMinAmount) ? Number(parsedMinAmount.toFixed(2)) : 0,
+        Number.isFinite(parsedMaxAmount) ? Number(parsedMaxAmount.toFixed(2)) : 0,
+        Number.isFinite(parsedProfitPercent) ? Number(parsedProfitPercent.toFixed(4)) : 0,
       ]
     ) as any
 
@@ -4376,7 +4599,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
     name, description, imageUrl, price, redeemRewardValue, isActive,
     cycleDays, sortOrder, planType, stockQuantity, expiresAt,
     requireCommissionLevel1Count, requireCommissionLevel2Count, requireCommissionLevel3Count,
-    maxPurchasesPerUser,
+    maxPurchasesPerUser, minAmount, maxAmount, profitPercent,
   } = req.body as {
     name?: string
     description?: string
@@ -4393,6 +4616,9 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
     requireCommissionLevel2Count?: number | string
     requireCommissionLevel3Count?: number | string
     maxPurchasesPerUser?: number | string
+    minAmount?: number | string
+    maxAmount?: number | string
+    profitPercent?: number | string
   }
 
   if (!productId || Number.isNaN(productId)) {
@@ -4420,13 +4646,16 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
   const parsedLevel3 = Math.max(0, Number(String(requireCommissionLevel3Count ?? 0)))
   const parsedExpiresAt = parsedPlanType === 'vip_day' && expiresAt ? String(expiresAt) : null
   const parsedMaxPurchasesPerUser = Math.max(0, Number(String(maxPurchasesPerUser ?? 0)))
+  const parsedMinAmount = Math.max(0, Number(String(minAmount ?? 0).replace(',', '.')))
+  const parsedMaxAmount = Math.max(0, Number(String(maxAmount ?? 0).replace(',', '.')))
+  const parsedProfitPercent = Math.max(0, Number(String(profitPercent ?? 0).replace(',', '.')))
 
   if (!parsedName) {
     res.status(400).json({ ok: false, error: 'Nome do produto é obrigatório.' })
     return
   }
 
-  if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
+  if (!Number.isFinite(parsedPrice) || parsedPrice < 0) {
     res.status(400).json({ ok: false, error: 'Preço inválido.' })
     return
   }
@@ -4463,6 +4692,9 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         require_commission_level_2_count = ?,
         require_commission_level_3_count = ?,
         max_purchases_per_user = ?,
+        min_amount = ?,
+        max_amount = ?,
+        profit_percent = ?,
         updated_at = NOW()
       WHERE id = ?
       `,
@@ -4482,6 +4714,9 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         parsedLevel2,
         parsedLevel3,
         parsedMaxPurchasesPerUser,
+        Number.isFinite(parsedMinAmount) ? Number(parsedMinAmount.toFixed(2)) : 0,
+        Number.isFinite(parsedMaxAmount) ? Number(parsedMaxAmount.toFixed(2)) : 0,
+        Number.isFinite(parsedProfitPercent) ? Number(parsedProfitPercent.toFixed(4)) : 0,
         productId,
       ]
     ) as any
@@ -4659,8 +4894,8 @@ app.post('/api/mini-tasks/:taskId/redeem', requireAuth, async (req, res) => {
       )
 
       await conn.query(
-        'UPDATE users SET balance = balance + ? WHERE id = ?',
-        [rewardAmount, userId]
+        'UPDATE users SET balance = balance + ?, commission_balance = COALESCE(commission_balance, 0) + ? WHERE id = ?',
+        [rewardAmount, rewardAmount, userId]
       )
 
       await conn.commit()
@@ -4868,8 +5103,10 @@ app.delete('/api/admin/mini-tasks/:id', requireMaxAdmin, async (req, res) => {
   }
 })
 
-app.get('/api/vip/levels', async (_req, res) => {
+app.get('/api/vip/levels', async (req, res) => {
   try {
+    const queryUserId = Number(req.query.userId ?? 0)
+
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
@@ -4877,26 +5114,58 @@ app.get('/api/vip/levels', async (_req, res) => {
         name,
         price,
         daily_task_limit AS dailyTaskLimit,
-        task_reward_multiplier AS taskRewardMultiplier,
+        task_reward_amount AS taskRewardAmount,
+        duration_days AS durationDays,
         benefits,
+        image_url AS imageUrl,
         is_active AS isActive,
-        sort_order AS sortOrder
+        sort_order AS sortOrder,
+        require_commission_level_1_count AS requireCommissionLevel1Count,
+        require_commission_level_2_count AS requireCommissionLevel2Count,
+        require_commission_level_3_count AS requireCommissionLevel3Count
       FROM vip_levels
-      WHERE is_active = 1
-      ORDER BY sort_order ASC, id ASC
+      WHERE COALESCE(price, 0) > 0
+      ORDER BY is_active DESC, sort_order ASC, id ASC
       `
     )
 
-    const levels = rows.map((row) => ({
-      id: Number(row.id),
-      name: String(row.name ?? ''),
-      price: Number(row.price ?? 0),
-      dailyTaskLimit: Number(row.dailyTaskLimit ?? 0),
-      taskRewardMultiplier: Number(row.taskRewardMultiplier ?? 1),
-      benefits: String(row.benefits ?? ''),
-      isActive: Number(row.isActive ?? 1) === 1,
-      sortOrder: Number(row.sortOrder ?? 0),
-    }))
+    // Se o pedido vier com userId, descobrir quais VIPs já foram comprados antes
+    // (e expiraram) para marcar como bloqueados para recompra.
+    let purchasedExpiredIds = new Set<number>()
+    if (Number.isFinite(queryUserId) && queryUserId > 0) {
+      const [usedRows] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT DISTINCT vip_level_id
+        FROM user_vips
+        WHERE user_id = ?
+          AND (status = 'inactive' OR (expires_at IS NOT NULL AND expires_at <= NOW()))
+        `,
+        [queryUserId]
+      )
+      purchasedExpiredIds = new Set<number>(
+        usedRows.map((r) => Number(r.vip_level_id))
+      )
+    }
+
+    const levels = rows.map((row) => {
+      const id = Number(row.id)
+      return {
+        id,
+        name: String(row.name ?? ''),
+        price: Number(row.price ?? 0),
+        dailyTaskLimit: Number(row.dailyTaskLimit ?? 0),
+        taskRewardAmount: Number(row.taskRewardAmount ?? 0),
+        durationDays: Number(row.durationDays ?? 365),
+        benefits: String(row.benefits ?? ''),
+        imageUrl: String(row.imageUrl ?? ''),
+        isActive: Number(row.isActive ?? 1) === 1,
+        sortOrder: Number(row.sortOrder ?? 0),
+        alreadyExpired: purchasedExpiredIds.has(id),
+        requireCommissionLevel1Count: Number(row.requireCommissionLevel1Count ?? 0),
+        requireCommissionLevel2Count: Number(row.requireCommissionLevel2Count ?? 0),
+        requireCommissionLevel3Count: Number(row.requireCommissionLevel3Count ?? 0),
+      }
+    })
 
     res.json({ ok: true, levels })
   } catch (err) {
@@ -4914,6 +5183,14 @@ app.get('/api/vip/user/:userId', async (req, res) => {
   }
 
   try {
+    // Auto-expirar VIPs vencidos antes de consultar
+    await pool.query(
+      `UPDATE user_vips
+       SET status = 'inactive'
+       WHERE user_id = ? AND status = 'active' AND expires_at IS NOT NULL AND expires_at <= NOW()`,
+      [userId]
+    )
+
     const [balanceRows] = await pool.query<RowDataPacket[]>(
       'SELECT balance FROM users WHERE id = ? LIMIT 1',
       [userId]
@@ -4937,8 +5214,9 @@ app.get('/api/vip/user/:userId', async (req, res) => {
         uv.expires_at AS expiresAt,
         vl.name AS levelName,
         vl.daily_task_limit AS dailyTaskLimit,
-        vl.task_reward_multiplier AS taskRewardMultiplier,
-        vl.price AS vipPrice
+        vl.task_reward_amount AS taskRewardAmount,
+        vl.price AS vipPrice,
+        vl.avatar_url AS avatarUrl
       FROM user_vips uv
       INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
       WHERE uv.user_id = ?
@@ -4969,8 +5247,9 @@ app.get('/api/vip/user/:userId', async (req, res) => {
         expiresAt: vip.expiresAt,
         levelName: String(vip.levelName ?? ''),
         dailyTaskLimit: Number(vip.dailyTaskLimit ?? 0),
-        taskRewardMultiplier: Number(vip.taskRewardMultiplier ?? 1),
+        taskRewardAmount: Number(vip.taskRewardAmount ?? 0),
         vipPrice: Number(vip.vipPrice ?? 0),
+        avatarUrl: String(vip.avatarUrl ?? ''),
       },
     })
   } catch (err) {
@@ -5015,7 +5294,11 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
     }
 
     const [levels] = await pool.query<RowDataPacket[]>(
-      'SELECT id, name, price, is_active AS isActive FROM vip_levels WHERE id = ? LIMIT 1',
+      `SELECT id, name, price, duration_days AS durationDays, is_active AS isActive,
+              require_commission_level_1_count AS reqLevel1,
+              require_commission_level_2_count AS reqLevel2,
+              require_commission_level_3_count AS reqLevel3
+       FROM vip_levels WHERE id = ? LIMIT 1`,
       [parsedVipLevelId]
     )
 
@@ -5025,7 +5308,117 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
     }
 
     const levelPrice = Number(levels[0].price ?? 0)
+    const levelDurationDays = Math.max(1, Math.round(Number(levels[0].durationDays ?? 365)))
     const currentBalance = Number(users[0].balance ?? 0)
+
+    // Bloqueia ativação de VIP gratuito (T0 - Estágio): só é concedido automaticamente no cadastro.
+    if (levelPrice <= 0) {
+      res.status(400).json({ ok: false, error: 'Este plano não está disponível para compra.' })
+      return
+    }
+
+    // Validar requisitos de convite (indicados com depósito) por nível
+    const reqLevel1 = Number(levels[0].reqLevel1 ?? 0)
+    const reqLevel2 = Number(levels[0].reqLevel2 ?? 0)
+    const reqLevel3 = Number(levels[0].reqLevel3 ?? 0)
+
+    if (reqLevel1 > 0 || reqLevel2 > 0 || reqLevel3 > 0) {
+      // Contar indicados com depósito nível 1
+      const [lvl1Rows] = await pool.query<RowDataPacket[]>(
+        'SELECT COUNT(*) AS cnt FROM users WHERE referred_by_user_id = ? AND COALESCE(total_deposits, 0) > 0',
+        [parsedUserId]
+      )
+      const inviteLevel1 = Number(lvl1Rows[0]?.cnt ?? 0)
+
+      // Contar indicados com depósito nível 2
+      const [lvl2Rows] = await pool.query<RowDataPacket[]>(
+        `SELECT COUNT(*) AS cnt FROM users
+         WHERE referred_by_user_id IN (SELECT id FROM users WHERE referred_by_user_id = ?)
+           AND COALESCE(total_deposits, 0) > 0`,
+        [parsedUserId]
+      )
+      const inviteLevel2 = Number(lvl2Rows[0]?.cnt ?? 0)
+
+      // Contar indicados com depósito nível 3
+      const [lvl3Rows] = await pool.query<RowDataPacket[]>(
+        `SELECT COUNT(*) AS cnt FROM users
+         WHERE referred_by_user_id IN (
+           SELECT id FROM users WHERE referred_by_user_id IN (
+             SELECT id FROM users WHERE referred_by_user_id = ?
+           )
+         )
+         AND COALESCE(total_deposits, 0) > 0`,
+        [parsedUserId]
+      )
+      const inviteLevel3 = Number(lvl3Rows[0]?.cnt ?? 0)
+
+      const missing: string[] = []
+      if (reqLevel1 > 0 && inviteLevel1 < reqLevel1) {
+        missing.push(`Nível 1: ${inviteLevel1}/${reqLevel1} indicados com depósito`)
+      }
+      if (reqLevel2 > 0 && inviteLevel2 < reqLevel2) {
+        missing.push(`Nível 2: ${inviteLevel2}/${reqLevel2} indicados com depósito`)
+      }
+      if (reqLevel3 > 0 && inviteLevel3 < reqLevel3) {
+        missing.push(`Nível 3: ${inviteLevel3}/${reqLevel3} indicados com depósito`)
+      }
+
+      if (missing.length > 0) {
+        res.status(400).json({
+          ok: false,
+          error: `Requisitos de convite não atingidos:\n${missing.join('\n')}`,
+        })
+        return
+      }
+    }
+
+    // Auto-expirar VIPs vencidos do usuário antes de qualquer checagem
+    await pool.query(
+      `UPDATE user_vips
+       SET status = 'inactive'
+       WHERE user_id = ? AND status = 'active' AND expires_at IS NOT NULL AND expires_at <= NOW()`,
+      [parsedUserId]
+    )
+
+    // Verificar se o usuário tem VIP ativo — se tiver, o estorno do antigo fica pendente
+    const [activeVipRows] = await pool.query<RowDataPacket[]>(
+      `SELECT uv.id, uv.vip_level_id AS vipLevelId, vl.name AS levelName, vl.price AS levelPrice, uv.expires_at AS expiresAt
+       FROM user_vips uv
+       INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
+       WHERE uv.user_id = ?
+         AND uv.status = 'active'
+         AND (uv.expires_at IS NULL OR uv.expires_at > NOW())
+       LIMIT 1`,
+      [parsedUserId]
+    )
+    const hasActiveVip = activeVipRows.length > 0
+    const previousVip = hasActiveVip ? activeVipRows[0] : null
+
+    // Impedir comprar o mesmo plano que já está ativo
+    if (hasActiveVip && Number(previousVip!.vipLevelId) === parsedVipLevelId) {
+      res.status(400).json({
+        ok: false,
+        error: 'Você já possui este plano ativo.',
+      })
+      return
+    }
+
+    // Bloquear recompra de um VIP que o usuário já teve antes (expirado ou inativo)
+    const [alreadyOwned] = await pool.query<RowDataPacket[]>(
+      `SELECT id FROM user_vips
+       WHERE user_id = ?
+         AND vip_level_id = ?
+         AND (status = 'inactive' OR (expires_at IS NOT NULL AND expires_at <= NOW()))
+       LIMIT 1`,
+      [parsedUserId, parsedVipLevelId]
+    )
+    if (alreadyOwned.length > 0) {
+      res.status(400).json({
+        ok: false,
+        error: 'Você já adquiriu este VIP anteriormente e ele expirou. Não é possível recomprar o mesmo VIP.',
+      })
+      return
+    }
 
     if (currentBalance < levelPrice) {
       res.status(400).json({
@@ -5053,10 +5446,16 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
       await conn.query(
         `
         UPDATE users
-        SET balance = COALESCE(balance, 0) - ?
+        SET
+          balance = COALESCE(balance, 0) - ?,
+          commission_balance = GREATEST(COALESCE(commission_balance, 0) - ?, 0),
+          recharge_balance = GREATEST(
+            COALESCE(recharge_balance, 0) - GREATEST(? - COALESCE(commission_balance, 0), 0),
+            0
+          )
         WHERE id = ?
         `,
-        [levelPrice, parsedUserId]
+        [levelPrice, levelPrice, levelPrice, parsedUserId]
       )
 
       await conn.query(
@@ -5069,9 +5468,9 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
           started_at,
           expires_at
         )
-        VALUES (?, ?, 'active', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY))
+        VALUES (?, ?, 'active', NOW(), DATE_ADD(NOW(), INTERVAL ? DAY))
         `,
-        [parsedUserId, parsedVipLevelId]
+        [parsedUserId, parsedVipLevelId, levelDurationDays]
       )
 
       // Regra solicitada:
@@ -5087,7 +5486,7 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
         [parsedUserId, saoPauloDate]
       )
 
-      await conn.query(
+      const [purchaseResult] = await conn.query<ResultSetHeader>(
         `
         INSERT INTO vip_purchase_history
         (
@@ -5102,7 +5501,29 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
         [parsedUserId, parsedVipLevelId, levelPrice, currentBalance, currentBalance - levelPrice]
       )
 
+      const purchaseId = purchaseResult.insertId
+
+      // Se o usuário tinha VIP ativo anterior, cria estorno pendente para o admin aprovar
+      if (hasActiveVip && previousVip) {
+        const oldVipPrice = Number(previousVip.levelPrice ?? 0)
+        if (oldVipPrice > 0) {
+          await conn.query(
+            `INSERT INTO vip_refunds (user_id, old_vip_level_id, new_vip_level_id, refund_amount, status)
+             VALUES (?, ?, ?, ?, 'pending')`,
+            [parsedUserId, Number(previousVip.vipLevelId), parsedVipLevelId, oldVipPrice]
+          )
+        }
+      }
+
       await conn.commit()
+
+      // Distribui comissões para os uplines (fora da transação principal)
+      applyReferralCommissionsForVipPurchase(parsedUserId, levelPrice, purchaseId).catch((err) => {
+        console.error('[vip-activate] Erro ao distribuir comissões:', err)
+      })
+
+      // Emite saldo atualizado via WebSocket para o comprador
+      emitBalanceUpdate(parsedUserId)
     } catch (error) {
       await conn.rollback()
       throw error
@@ -5110,16 +5531,576 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
       conn.release()
     }
 
+    const upgradeMsg = hasActiveVip && previousVip
+      ? ` Estorno do plano anterior "${String(previousVip.levelName)}" está pendente de aprovação.`
+      : ''
+
     res.json({
       ok: true,
-      message: `VIP ${String(levels[0].name ?? '')} ativado com sucesso.`,
+      message: `VIP ${String(levels[0].name ?? '')} ativado com sucesso.${upgradeMsg}`,
       amountPaid: levelPrice,
       balanceBefore: currentBalance,
       balanceAfter: currentBalance - levelPrice,
+      upgraded: hasActiveVip,
+    })
+  } catch (err: any) {
+    console.error('[vip-activate]', err)
+    const errMsg = typeof err?.message === 'string' && err.message.length > 0
+      ? err.message
+      : 'Erro interno ao ativar VIP.'
+    res.status(500).json({ ok: false, error: errMsg })
+  }
+})
+
+// ═══════════════════════════════════════════════════════════════
+// ADMIN: CRUD de níveis VIP (vip_levels)
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/admin/vip/levels', requireMaxAdmin, async (_req, res) => {
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        id,
+        name,
+        price,
+        daily_task_limit   AS dailyTaskLimit,
+        task_reward_amount AS taskRewardAmount,
+        duration_days      AS durationDays,
+        benefits,
+        image_url          AS imageUrl,
+        avatar_url         AS avatarUrl,
+        is_active          AS isActive,
+        is_default         AS isDefault,
+        sort_order         AS sortOrder,
+        require_commission_level_1_count AS requireCommissionLevel1Count,
+        require_commission_level_2_count AS requireCommissionLevel2Count,
+        require_commission_level_3_count AS requireCommissionLevel3Count
+      FROM vip_levels
+      ORDER BY sort_order ASC, id ASC
+      `
+    )
+
+    const levels = rows.map((row) => ({
+      id: Number(row.id),
+      name: String(row.name ?? ''),
+      price: Number(row.price ?? 0),
+      dailyTaskLimit: Number(row.dailyTaskLimit ?? 0),
+      taskRewardAmount: Number(row.taskRewardAmount ?? 0),
+      durationDays: Number(row.durationDays ?? 365),
+      benefits: String(row.benefits ?? ''),
+      imageUrl: String(row.imageUrl ?? ''),
+      avatarUrl: String(row.avatarUrl ?? ''),
+      isActive: Number(row.isActive ?? 1) === 1,
+      isDefault: Number(row.isDefault ?? 0) === 1,
+      sortOrder: Number(row.sortOrder ?? 0),
+      requireCommissionLevel1Count: Number(row.requireCommissionLevel1Count ?? 0),
+      requireCommissionLevel2Count: Number(row.requireCommissionLevel2Count ?? 0),
+      requireCommissionLevel3Count: Number(row.requireCommissionLevel3Count ?? 0),
+    }))
+
+    res.json({ ok: true, levels })
+  } catch (err) {
+    console.error('[admin-vip-levels-get]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao listar níveis VIP.' })
+  }
+})
+
+app.post('/api/admin/vip/levels', requireMaxAdmin, async (req, res) => {
+  const { name, price, dailyTaskLimit, taskRewardAmount, durationDays, benefits, imageUrl, isActive, isDefault, sortOrder, requireCommissionLevel1Count, requireCommissionLevel2Count, requireCommissionLevel3Count } = req.body as {
+    name?: string
+    price?: number | string
+    dailyTaskLimit?: number | string
+    taskRewardAmount?: number | string
+    durationDays?: number | string
+    benefits?: string
+    imageUrl?: string
+    isActive?: boolean | number
+    isDefault?: boolean | number
+    sortOrder?: number | string
+    requireCommissionLevel1Count?: number | string
+    requireCommissionLevel2Count?: number | string
+    requireCommissionLevel3Count?: number | string
+  }
+
+  const parsedName = String(name ?? '').trim()
+  if (!parsedName) {
+    res.status(400).json({ ok: false, error: 'Nome é obrigatório.' })
+    return
+  }
+
+  const parsedPrice        = Math.max(0, Number(String(price ?? '0').replace(',', '.')))
+  const parsedLimit        = Math.max(0, Math.round(Number(dailyTaskLimit ?? 0)))
+  const parsedRewardAmount = Math.max(0, Number(String(taskRewardAmount ?? '0').replace(',', '.')))
+  const parsedDuration     = Math.max(1, Math.round(Number(durationDays ?? 365)))
+  const parsedBenefits     = String(benefits ?? '').trim()
+  const parsedImageUrl     = String(imageUrl ?? '').trim()
+  const parsedActive       = isActive === true || Number(isActive) === 1 ? 1 : 0
+  const parsedDefault      = isDefault === true || Number(isDefault) === 1 ? 1 : 0
+  const parsedSortOrder    = Number(sortOrder ?? 0)
+  const parsedReqLevel1    = Math.max(0, Math.round(Number(requireCommissionLevel1Count ?? 0)))
+  const parsedReqLevel2    = Math.max(0, Math.round(Number(requireCommissionLevel2Count ?? 0)))
+  const parsedReqLevel3    = Math.max(0, Math.round(Number(requireCommissionLevel3Count ?? 0)))
+
+  if (!Number.isFinite(parsedPrice) || !Number.isFinite(parsedRewardAmount) || !Number.isFinite(parsedDuration)) {
+    res.status(400).json({ ok: false, error: 'Valores numéricos inválidos.' })
+    return
+  }
+
+  const conn = await pool.getConnection()
+  try {
+    await conn.beginTransaction()
+
+    // Se este VIP for marcado como padrão, desmarcar todos os outros primeiro.
+    if (parsedDefault === 1) {
+      await conn.query(`UPDATE vip_levels SET is_default = 0 WHERE is_default = 1`)
+    }
+
+    const [result] = await conn.query(
+      `
+      INSERT INTO vip_levels
+        (name, price, daily_task_limit, task_reward_amount, duration_days, benefits, image_url, is_active, is_default, sort_order, require_commission_level_1_count, require_commission_level_2_count, require_commission_level_3_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [parsedName, parsedPrice, parsedLimit, parsedRewardAmount, parsedDuration, parsedBenefits, parsedImageUrl || null, parsedActive, parsedDefault, parsedSortOrder, parsedReqLevel1, parsedReqLevel2, parsedReqLevel3]
+    ) as any
+
+    await conn.commit()
+
+    res.json({ ok: true, message: 'VIP criado com sucesso.', id: Number(result?.insertId ?? 0) })
+  } catch (err) {
+    await conn.rollback().catch(() => null)
+    console.error('[admin-vip-levels-post]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao criar VIP.' })
+  } finally {
+    conn.release()
+  }
+})
+
+app.put('/api/admin/vip/levels/:id', requireMaxAdmin, async (req, res) => {
+  const levelId = Number(req.params.id)
+  if (!levelId || !Number.isInteger(levelId) || levelId <= 0) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+
+  const { name, price, dailyTaskLimit, taskRewardAmount, durationDays, benefits, imageUrl, isActive, isDefault, sortOrder, requireCommissionLevel1Count, requireCommissionLevel2Count, requireCommissionLevel3Count } = req.body as {
+    name?: string
+    price?: number | string
+    dailyTaskLimit?: number | string
+    taskRewardAmount?: number | string
+    durationDays?: number | string
+    benefits?: string
+    imageUrl?: string
+    isActive?: boolean | number
+    isDefault?: boolean | number
+    sortOrder?: number | string
+    requireCommissionLevel1Count?: number | string
+    requireCommissionLevel2Count?: number | string
+    requireCommissionLevel3Count?: number | string
+  }
+
+  const parsedName = String(name ?? '').trim()
+  if (!parsedName) {
+    res.status(400).json({ ok: false, error: 'Nome é obrigatório.' })
+    return
+  }
+
+  const parsedPrice        = Math.max(0, Number(String(price ?? '0').replace(',', '.')))
+  const parsedLimit        = Math.max(0, Math.round(Number(dailyTaskLimit ?? 0)))
+  const parsedRewardAmount = Math.max(0, Number(String(taskRewardAmount ?? '0').replace(',', '.')))
+  const parsedDuration     = Math.max(1, Math.round(Number(durationDays ?? 365)))
+  const parsedBenefits     = String(benefits ?? '').trim()
+  const parsedImageUrl     = String(imageUrl ?? '').trim()
+  const parsedActive       = isActive === true || Number(isActive) === 1 ? 1 : 0
+  const parsedDefault      = isDefault === true || Number(isDefault) === 1 ? 1 : 0
+  const parsedSortOrder    = Number(sortOrder ?? 0)
+  const parsedReqLevel1    = Math.max(0, Math.round(Number(requireCommissionLevel1Count ?? 0)))
+  const parsedReqLevel2    = Math.max(0, Math.round(Number(requireCommissionLevel2Count ?? 0)))
+  const parsedReqLevel3    = Math.max(0, Math.round(Number(requireCommissionLevel3Count ?? 0)))
+
+  if (!Number.isFinite(parsedPrice) || !Number.isFinite(parsedRewardAmount) || !Number.isFinite(parsedDuration)) {
+    res.status(400).json({ ok: false, error: 'Valores numéricos inválidos.' })
+    return
+  }
+
+  const conn = await pool.getConnection()
+  try {
+    await conn.beginTransaction()
+
+    // Se este VIP for marcado como padrão, desmarcar todos os outros primeiro.
+    if (parsedDefault === 1) {
+      await conn.query(`UPDATE vip_levels SET is_default = 0 WHERE id <> ? AND is_default = 1`, [levelId])
+    }
+
+    const [result] = await conn.query(
+      `
+      UPDATE vip_levels
+      SET name = ?, price = ?, daily_task_limit = ?, task_reward_amount = ?, duration_days = ?, benefits = ?, image_url = ?, is_active = ?, is_default = ?, sort_order = ?, require_commission_level_1_count = ?, require_commission_level_2_count = ?, require_commission_level_3_count = ?
+      WHERE id = ?
+      `,
+      [parsedName, parsedPrice, parsedLimit, parsedRewardAmount, parsedDuration, parsedBenefits, parsedImageUrl || null, parsedActive, parsedDefault, parsedSortOrder, parsedReqLevel1, parsedReqLevel2, parsedReqLevel3, levelId]
+    ) as any
+
+    if (Number(result?.affectedRows ?? 0) === 0) {
+      await conn.rollback().catch(() => null)
+      res.status(404).json({ ok: false, error: 'VIP não encontrado.' })
+      return
+    }
+
+    await conn.commit()
+
+    res.json({ ok: true, message: 'VIP atualizado com sucesso.' })
+  } catch (err) {
+    await conn.rollback().catch(() => null)
+    console.error('[admin-vip-levels-put]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao atualizar VIP.' })
+  } finally {
+    conn.release()
+  }
+})
+
+app.delete('/api/admin/vip/levels/:id', requireMaxAdmin, async (req, res) => {
+  const levelId = Number(req.params.id)
+  if (!levelId || !Number.isInteger(levelId) || levelId <= 0) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+
+  try {
+    const [inUseRows] = await pool.query<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total FROM user_vips WHERE vip_level_id = ? AND status = 'active'`,
+      [levelId]
+    )
+    const inUseCount = Number(inUseRows[0]?.total ?? 0)
+
+    if (inUseCount > 0) {
+      res.status(400).json({
+        ok: false,
+        error: `Não é possível remover: ${inUseCount} usuário(s) ativo(s) nesse VIP.`,
+      })
+      return
+    }
+
+    const [result] = await pool.query(
+      `DELETE FROM vip_levels WHERE id = ?`,
+      [levelId]
+    ) as any
+
+    if (Number(result?.affectedRows ?? 0) === 0) {
+      res.status(404).json({ ok: false, error: 'VIP não encontrado.' })
+      return
+    }
+
+    res.json({ ok: true, message: 'VIP removido com sucesso.' })
+  } catch (err) {
+    console.error('[admin-vip-levels-delete]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao remover VIP.' })
+  }
+})
+
+// ═══════════════════════════════════════════════════════════════
+// ADMIN: Upload de foto VIP (salva arquivo e atualiza image_url)
+// ═══════════════════════════════════════════════════════════════
+
+app.post('/api/admin/vip/levels/:id/upload-photo', requireMaxAdmin, async (req, res) => {
+  const levelId = Number(req.params.id)
+  if (!levelId || Number.isNaN(levelId)) {
+    res.status(400).json({ ok: false, error: 'ID do VIP inválido.' })
+    return
+  }
+
+  const { imageBase64 } = req.body as { imageBase64?: string }
+  if (!imageBase64 || typeof imageBase64 !== 'string') {
+    res.status(400).json({ ok: false, error: 'Imagem base64 é obrigatória.' })
+    return
+  }
+
+  try {
+    // Extrair extensão e dados do base64
+    const match = imageBase64.match(/^data:image\/(png|jpe?g|gif|webp);base64,(.+)$/)
+    if (!match) {
+      res.status(400).json({ ok: false, error: 'Formato de imagem inválido. Envie PNG, JPG, GIF ou WebP.' })
+      return
+    }
+
+    const ext = match[1] === 'jpeg' ? 'jpg' : match[1]
+    const buffer = Buffer.from(match[2], 'base64')
+
+    // Limitar tamanho (5MB)
+    if (buffer.length > 5 * 1024 * 1024) {
+      res.status(400).json({ ok: false, error: 'Imagem muito grande. Máximo 5MB.' })
+      return
+    }
+
+    const filename = `vip-${levelId}-${Date.now()}.${ext}`
+    const filepath = path.join(UPLOADS_DIR, filename)
+    fs.writeFileSync(filepath, buffer)
+
+    const avatarUrl = `/uploads/${filename}`
+
+    await pool.query(
+      'UPDATE vip_levels SET avatar_url = ? WHERE id = ?',
+      [avatarUrl, levelId]
+    )
+
+    res.json({ ok: true, avatarUrl, message: 'Foto atualizada com sucesso.' })
+  } catch (err) {
+    console.error('[admin-vip-upload-photo]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao fazer upload da foto.' })
+  }
+})
+
+// ═══════════════════════════════════════════════════════════════
+// ADMIN: Estornos VIP pendentes (vip_refunds)
+// ═══════════════════════════════════════════════════════════════
+
+// Listar todos os estornos
+app.get('/api/admin/vip-refunds', requireMaxAdmin, async (_req: AuthenticatedRequest, res) => {
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(`
+      SELECT
+        vr.id,
+        vr.user_id         AS userId,
+        u.name             AS userName,
+        u.phone            AS userPhone,
+        vr.old_vip_level_id AS oldVipLevelId,
+        old_vl.name        AS oldVipName,
+        old_vl.price       AS oldVipPrice,
+        vr.new_vip_level_id AS newVipLevelId,
+        new_vl.name        AS newVipName,
+        new_vl.price       AS newVipPrice,
+        vr.refund_amount   AS refundAmount,
+        vr.status,
+        vr.admin_note      AS adminNote,
+        vr.reviewed_by     AS reviewedBy,
+        adm.name           AS reviewedByName,
+        vr.reviewed_at     AS reviewedAt,
+        vr.created_at      AS createdAt
+      FROM vip_refunds vr
+      LEFT JOIN users u       ON u.id = vr.user_id
+      LEFT JOIN vip_levels old_vl ON old_vl.id = vr.old_vip_level_id
+      LEFT JOIN vip_levels new_vl ON new_vl.id = vr.new_vip_level_id
+      LEFT JOIN users adm     ON adm.id = vr.reviewed_by
+      ORDER BY
+        CASE vr.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END,
+        vr.created_at DESC
+    `)
+
+    const refunds = rows.map((r) => ({
+      id: Number(r.id),
+      userId: Number(r.userId),
+      userName: String(r.userName ?? ''),
+      userPhone: String(r.userPhone ?? ''),
+      oldVipLevelId: Number(r.oldVipLevelId),
+      oldVipName: String(r.oldVipName ?? 'Removido'),
+      oldVipPrice: Number(r.oldVipPrice ?? 0),
+      newVipLevelId: Number(r.newVipLevelId),
+      newVipName: String(r.newVipName ?? 'Removido'),
+      newVipPrice: Number(r.newVipPrice ?? 0),
+      refundAmount: Number(r.refundAmount),
+      status: String(r.status),
+      adminNote: r.adminNote ? String(r.adminNote) : null,
+      reviewedBy: r.reviewedBy ? Number(r.reviewedBy) : null,
+      reviewedByName: r.reviewedByName ? String(r.reviewedByName) : null,
+      reviewedAt: r.reviewedAt ?? null,
+      createdAt: r.createdAt ?? null,
+    }))
+
+    res.json({ ok: true, refunds })
+  } catch (err) {
+    console.error('[admin-vip-refunds-list]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao listar estornos VIP.' })
+  }
+})
+
+// Aprovar estorno — credita o valor ao usuário
+app.post('/api/admin/vip-refunds/:id/approve', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
+  const refundId = Number(req.params.id)
+  const adminNote = String(req.body?.adminNote ?? '').trim()
+  const adminId = Number(req.authUser?.id ?? 0)
+
+  if (!refundId || !Number.isFinite(refundId)) {
+    res.status(400).json({ ok: false, error: 'ID de estorno inválido.' })
+    return
+  }
+
+  const conn = await pool.getConnection()
+  try {
+    await conn.beginTransaction()
+
+    const [refundRows] = await conn.query<RowDataPacket[]>(
+      `SELECT id, user_id, refund_amount, status FROM vip_refunds WHERE id = ? FOR UPDATE`,
+      [refundId]
+    )
+
+    if (refundRows.length === 0) {
+      await conn.rollback()
+      res.status(404).json({ ok: false, error: 'Estorno não encontrado.' })
+      return
+    }
+
+    const refund = refundRows[0]
+
+    if (String(refund.status) !== 'pending') {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: `Este estorno já foi ${String(refund.status) === 'approved' ? 'aprovado' : 'rejeitado'}.` })
+      return
+    }
+
+    const refundAmount = Number(refund.refund_amount)
+    const userId = Number(refund.user_id)
+
+    // Credita o valor ao usuário (no balance e recharge_balance)
+    await conn.query(
+      `UPDATE users
+       SET balance = COALESCE(balance, 0) + ?,
+           recharge_balance = COALESCE(recharge_balance, 0) + ?
+       WHERE id = ?`,
+      [refundAmount, refundAmount, userId]
+    )
+
+    // Marca como aprovado
+    await conn.query(
+      `UPDATE vip_refunds
+       SET status = 'approved', reviewed_by = ?, reviewed_at = NOW(), admin_note = ?
+       WHERE id = ?`,
+      [adminId, adminNote || null, refundId]
+    )
+
+    await conn.commit()
+
+    // Emite saldo atualizado via WebSocket
+    emitBalanceUpdate(userId)
+
+    res.json({ ok: true, message: `Estorno de R$ ${refundAmount.toFixed(2)} aprovado e creditado ao usuário.` })
+  } catch (err) {
+    await conn.rollback()
+    console.error('[admin-vip-refunds-approve]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao aprovar estorno.' })
+  } finally {
+    conn.release()
+  }
+})
+
+// Rejeitar estorno
+app.post('/api/admin/vip-refunds/:id/reject', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
+  const refundId = Number(req.params.id)
+  const adminNote = String(req.body?.adminNote ?? '').trim()
+  const adminId = Number(req.authUser?.id ?? 0)
+
+  if (!refundId || !Number.isFinite(refundId)) {
+    res.status(400).json({ ok: false, error: 'ID de estorno inválido.' })
+    return
+  }
+
+  try {
+    const [refundRows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, status FROM vip_refunds WHERE id = ?`,
+      [refundId]
+    )
+
+    if (refundRows.length === 0) {
+      res.status(404).json({ ok: false, error: 'Estorno não encontrado.' })
+      return
+    }
+
+    if (String(refundRows[0].status) !== 'pending') {
+      res.status(400).json({ ok: false, error: `Este estorno já foi ${String(refundRows[0].status) === 'approved' ? 'aprovado' : 'rejeitado'}.` })
+      return
+    }
+
+    await pool.query(
+      `UPDATE vip_refunds
+       SET status = 'rejected', reviewed_by = ?, reviewed_at = NOW(), admin_note = ?
+       WHERE id = ?`,
+      [adminId, adminNote || null, refundId]
+    )
+
+    res.json({ ok: true, message: 'Estorno rejeitado.' })
+  } catch (err) {
+    console.error('[admin-vip-refunds-reject]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao rejeitar estorno.' })
+  }
+})
+
+// Histórico das tarefas de mineração concluídas pelo usuário
+app.get('/api/mining/history/:userId', async (req, res) => {
+  const userId = Number(req.params.userId)
+  const from = String(req.query.from ?? '').trim()
+  const to = String(req.query.to ?? '').trim()
+  const hasRange = Boolean(from && to)
+
+  if (!userId || Number.isNaN(userId)) {
+    res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  try {
+    const [users] = await pool.query<RowDataPacket[]>(
+      'SELECT id FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    )
+
+    if (users.length === 0) {
+      res.status(404).json({ ok: false, error: 'Usuário não encontrado.' })
+      return
+    }
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        p.id,
+        p.task_id AS taskId,
+        t.name AS taskName,
+        t.description AS taskDescription,
+        p.progress_date AS progressDate,
+        p.completed_count AS completedCount,
+        p.earned_amount AS earnedAmount,
+        p.created_at AS createdAt,
+        p.updated_at AS updatedAt
+      FROM user_mining_task_progress p
+      LEFT JOIN mining_tasks t ON t.id = p.task_id
+      WHERE p.user_id = ?
+        AND p.completed_count > 0
+        ${hasRange ? 'AND p.progress_date BETWEEN ? AND ?' : ''}
+      ORDER BY p.progress_date DESC, p.updated_at DESC, p.id DESC
+      LIMIT 500
+      `,
+      hasRange ? [userId, from, to] : [userId]
+    )
+
+    const records = rows.map((row) => ({
+      id: Number(row.id),
+      taskId: Number(row.taskId ?? 0),
+      taskName: String(row.taskName ?? `Tarefa #${row.taskId}`),
+      taskDescription: String(row.taskDescription ?? ''),
+      progressDate: row.progressDate ?? null,
+      completedCount: Number(row.completedCount ?? 0),
+      earnedAmount: Number(row.earnedAmount ?? 0),
+      createdAt: row.createdAt ?? null,
+      updatedAt: row.updatedAt ?? null,
+    }))
+
+    const totalEarned = records.reduce((sum, r) => sum + Number(r.earnedAmount ?? 0), 0)
+    const totalCompleted = records.reduce((sum, r) => sum + Number(r.completedCount ?? 0), 0)
+
+    res.json({
+      ok: true,
+      userId,
+      filters: {
+        from: hasRange ? from : null,
+        to: hasRange ? to : null,
+      },
+      summary: {
+        totalEarned: Number(totalEarned.toFixed(2)),
+        totalCompleted,
+        totalRecords: records.length,
+      },
+      records,
     })
   } catch (err) {
-    console.error('[vip-activate]', err)
-    res.status(500).json({ ok: false, error: 'Erro ao ativar VIP.' })
+    console.error('[mining-history]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar histórico de tarefas.' })
   }
 })
 
@@ -5133,6 +6114,14 @@ app.get('/api/mining/tasks/:userId', async (req, res) => {
 
   try {
     await settleExpiredCyclesForUser(userId)
+
+    // Auto-expirar VIPs vencidos antes de consultar tarefas
+    await pool.query(
+      `UPDATE user_vips
+       SET status = 'inactive'
+       WHERE user_id = ? AND status = 'active' AND expires_at IS NOT NULL AND expires_at <= NOW()`,
+      [userId]
+    )
 
     const [users] = await pool.query<RowDataPacket[]>(
       'SELECT id FROM users WHERE id = ? LIMIT 1',
@@ -5151,7 +6140,7 @@ app.get('/api/mining/tasks/:userId', async (req, res) => {
         uv.vip_level_id AS vipLevelId,
         vl.name AS vipName,
         vl.daily_task_limit AS vipDailyTaskLimit,
-        vl.task_reward_multiplier AS vipMultiplier
+        vl.task_reward_amount AS vipRewardAmount
       FROM user_vips uv
       INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
       WHERE uv.user_id = ?
@@ -5174,7 +6163,7 @@ app.get('/api/mining/tasks/:userId', async (req, res) => {
 
     const vip = vipRows[0]
     const vipDailyTaskLimit = Number(vip.vipDailyTaskLimit ?? 0)
-    const vipMultiplier = Number(vip.vipMultiplier ?? 1)
+    const vipRewardAmount = Number(vip.vipRewardAmount ?? 0)
 
     const saoPauloDate = getSaoPauloDateString()
 
@@ -5196,7 +6185,6 @@ app.get('/api/mining/tasks/:userId', async (req, res) => {
         t.id,
         t.name,
         t.description,
-        t.reward_amount AS baseRewardAmount,
         COALESCE(p.completed_count, 0) AS completedToday,
         COALESCE(p.earned_amount, 0) AS earnedToday
       FROM mining_tasks t
@@ -5210,10 +6198,9 @@ app.get('/api/mining/tasks/:userId', async (req, res) => {
       [userId, saoPauloDate]
     )
 
-    const tasks = rows.map((task) => {
-      const baseRewardAmount = Number(task.baseRewardAmount ?? 0)
-      const rewardAmount = Number((baseRewardAmount * vipMultiplier).toFixed(2))
+    const rewardAmount = Number(vipRewardAmount.toFixed(2))
 
+    const tasks = rows.map((task) => {
       return {
         id: Number(task.id),
         name: String(task.name ?? ''),
@@ -5232,7 +6219,7 @@ app.get('/api/mining/tasks/:userId', async (req, res) => {
         vipLevelId: Number(vip.vipLevelId),
         vipName: String(vip.vipName ?? ''),
         vipDailyTaskLimit,
-        vipMultiplier,
+        vipRewardAmount,
       },
       totalCompletedToday,
       remainingByVip,
@@ -5285,7 +6272,7 @@ app.post('/api/mining/tasks/complete', requireAuth, async (req: AuthenticatedReq
         uv.vip_level_id AS vipLevelId,
         vl.name AS vipName,
         vl.daily_task_limit AS vipDailyTaskLimit,
-        vl.task_reward_multiplier AS vipMultiplier
+        vl.task_reward_amount AS vipRewardAmount
       FROM user_vips uv
       INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
       WHERE uv.user_id = ?
@@ -5308,7 +6295,7 @@ app.post('/api/mining/tasks/complete', requireAuth, async (req: AuthenticatedReq
 
     const vip = vipRows[0]
     const vipDailyTaskLimit = Number(vip.vipDailyTaskLimit ?? 0)
-    const vipMultiplier = Number(vip.vipMultiplier ?? 1)
+    const vipRewardAmount = Number(vip.vipRewardAmount ?? 0)
 
     const saoPauloDate = getSaoPauloDateString()
 
@@ -5329,7 +6316,7 @@ app.post('/api/mining/tasks/complete', requireAuth, async (req: AuthenticatedReq
 
     const [taskRows] = await pool.query<RowDataPacket[]>(
       `
-      SELECT id, reward_amount AS baseRewardAmount, is_active AS isActive
+      SELECT id, is_active AS isActive
       FROM mining_tasks
       WHERE id = ?
       LIMIT 1
@@ -5348,7 +6335,7 @@ app.post('/api/mining/tasks/complete', requireAuth, async (req: AuthenticatedReq
       return
     }
 
-    const rewardAmount = Number((Number(task.baseRewardAmount ?? 0) * vipMultiplier).toFixed(2))
+    const rewardAmount = Number(vipRewardAmount.toFixed(2))
 
     const [progressRows] = await pool.query<RowDataPacket[]>(
       `
@@ -5369,7 +6356,10 @@ app.post('/api/mining/tasks/complete', requireAuth, async (req: AuthenticatedReq
       return
     }
 
+    let progressId: number
+
     if (progressRows.length > 0) {
+      progressId = Number(progressRows[0].id)
       await pool.query(
         `
         UPDATE user_mining_task_progress
@@ -5379,10 +6369,10 @@ app.post('/api/mining/tasks/complete', requireAuth, async (req: AuthenticatedReq
           updated_at = NOW()
         WHERE id = ?
         `,
-        [rewardAmount, progressRows[0].id]
+        [rewardAmount, progressId]
       )
     } else {
-      await pool.query(
+      const [insertResult] = await pool.query(
         `
         INSERT INTO user_mining_task_progress
         (
@@ -5395,17 +6385,75 @@ app.post('/api/mining/tasks/complete', requireAuth, async (req: AuthenticatedReq
         VALUES (?, ?, ?, 1, ?)
         `,
         [parsedUserId, parsedTaskId, saoPauloDate, rewardAmount]
-      )
+      ) as any
+      progressId = Number(insertResult?.insertId ?? 0)
     }
+
+    // ── Captura saldo anterior para log ──
+    const [balanceRows] = await pool.query<RowDataPacket[]>(
+      'SELECT COALESCE(balance, 0) AS balance FROM users WHERE id = ? LIMIT 1',
+      [parsedUserId]
+    )
+    const oldBalance = Number(balanceRows[0]?.balance ?? 0)
+    const newBalance = Number((oldBalance + rewardAmount).toFixed(2))
 
     await pool.query(
       `
       UPDATE users
-      SET balance = COALESCE(balance, 0) + ?
+      SET
+        balance = COALESCE(balance, 0) + ?
       WHERE id = ?
       `,
       [rewardAmount, parsedUserId]
     )
+
+    // ── Registra log da tarefa concluída ──
+    try {
+      await pool.query(
+        `
+        INSERT INTO logs
+        (
+          user_id,
+          entity_type,
+          entity_id,
+          action,
+          old_balance,
+          new_balance,
+          amount,
+          metadata
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          parsedUserId,
+          'mining_task',
+          parsedTaskId,
+          'mining_task_complete',
+          Number(oldBalance.toFixed(2)),
+          newBalance,
+          Number(rewardAmount.toFixed(2)),
+          JSON.stringify({
+            taskId: parsedTaskId,
+            progressId,
+            vipName: String(vip.vipName ?? ''),
+            vipLevelId: Number(vip.vipLevelId ?? 0),
+            progressDate: saoPauloDate,
+          }),
+        ]
+      )
+    } catch (logErr) {
+      console.error('[mining-task-complete-log]', logErr)
+    }
+
+    // ── Distribui comissões de tarefa para os uplines (referral tree) ──
+    if (progressId > 0) {
+      applyReferralCommissionsForTask(progressId, parsedUserId, rewardAmount, saoPauloDate).catch((err) => {
+        console.error('[task-commission-async]', err)
+      })
+    }
+
+    // Emite saldo atualizado via WebSocket
+    emitBalanceUpdate(parsedUserId)
 
     res.json({
       ok: true,
@@ -5433,7 +6481,7 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
     await settleExpiredCyclesForUser(userId)
 
     const [users] = await pool.query<RowDataPacket[]>(
-      'SELECT id, balance FROM users WHERE id = ? LIMIT 1',
+      'SELECT id, balance, commission_balance FROM users WHERE id = ? LIMIT 1',
       [userId]
     )
 
@@ -5442,7 +6490,7 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
       return
     }
 
-    const withdrawableBalance = Number(users[0].balance ?? 0)
+    const withdrawableBalance = Number(users[0].commission_balance ?? 0)
 
     const [teamRows] = await pool.query<RowDataPacket[]>(
       'SELECT COUNT(*) AS total FROM users WHERE referred_by_user_id = ?',
@@ -5538,7 +6586,7 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
 })
 
 app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedRequest, res) => {
-  const { userId, cycleProductId } = req.body as { userId?: number; cycleProductId?: number }
+  const { userId, cycleProductId, investAmount } = req.body as { userId?: number; cycleProductId?: number; investAmount?: number | string }
 
   const parsedUserId = Number(userId)
   const parsedCycleProductId = Number(cycleProductId)
@@ -5581,7 +6629,10 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
              require_commission_level_1_count AS requireLevel1,
              require_commission_level_2_count AS requireLevel2,
              require_commission_level_3_count AS requireLevel3,
-             COALESCE(max_purchases_per_user, 0) AS maxPurchasesPerUser
+             COALESCE(max_purchases_per_user, 0) AS maxPurchasesPerUser,
+             COALESCE(min_amount, 0) AS minAmount,
+             COALESCE(max_amount, 0) AS maxAmount,
+             COALESCE(profit_percent, 0) AS profitPercent
       FROM cycle_products
       WHERE id = ?
       LIMIT 1
@@ -5620,7 +6671,41 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
 
     const product = products[0]
     const userBalance = Number(users[0].balance ?? 0)
-    const amount = Number(product.amount ?? 0)
+    const productMinAmount = Number(product.minAmount ?? 0)
+    const productMaxAmount = Number(product.maxAmount ?? 0)
+    const productProfitPercent = Number(product.profitPercent ?? 0)
+
+    let amount: number
+    let profit: number
+
+    // Usuário sempre escolhe o valor de investimento entre min e max
+    const parsedInvestAmount = Number(String(investAmount ?? 0).replace(',', '.'))
+    if (!Number.isFinite(parsedInvestAmount) || parsedInvestAmount <= 0) {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: 'Informe o valor do investimento.' })
+      return
+    }
+    if (productMinAmount > 0 && parsedInvestAmount < productMinAmount) {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: `O valor mínimo de investimento é R$ ${productMinAmount.toFixed(2)}.` })
+      return
+    }
+    if (productMaxAmount > 0 && parsedInvestAmount > productMaxAmount) {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: `O valor máximo de investimento é R$ ${productMaxAmount.toFixed(2)}.` })
+      return
+    }
+    amount = Number(parsedInvestAmount.toFixed(2))
+    const cycleDaysNum = Number(product.cycleDays ?? 0)
+    // Se profitPercent > 0, usa ele; senão usa o campo profit como porcentagem diária
+    const effectivePercent = productProfitPercent > 0 ? productProfitPercent : Number(product.profit ?? 0)
+    if (effectivePercent > 0) {
+      // Porcentagem diária × dias do ciclo
+      const dailyProfit = amount * (effectivePercent / 100)
+      profit = Number((dailyProfit * cycleDaysNum).toFixed(2))
+    } else {
+      profit = 0
+    }
 
     if (userBalance < amount) {
       await conn.rollback()
@@ -5722,10 +6807,16 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
     await conn.query(
       `
       UPDATE users
-      SET balance = COALESCE(balance, 0) - ?
+      SET
+        balance = COALESCE(balance, 0) - ?,
+        recharge_balance = GREATEST(COALESCE(recharge_balance, 0) - ?, 0),
+        commission_balance = GREATEST(
+          COALESCE(commission_balance, 0) - GREATEST(? - COALESCE(recharge_balance, 0), 0),
+          0
+        )
       WHERE id = ?
       `,
-      [amount, parsedUserId]
+      [amount, amount, amount, parsedUserId]
     )
 
     // Decrementa o estoque do produto (protegido pelo FOR UPDATE acima)
@@ -5757,7 +6848,7 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
         parsedUserId,
         Number(product.id),
         amount,
-        Number(product.profit ?? 0),
+        profit,
         Number(product.cycleDays ?? 0),
         Number(product.cycleDays ?? 0),
       ]
@@ -6052,12 +7143,18 @@ app.get('/api/team/members/:userId', async (req, res) => {
         rt.level,
         rt.created_at AS createdAt,
         COALESCE(SUM(CASE WHEN LOWER(cp.status) IN ('paid','payment.paid') THEN cp.amount ELSE 0 END), 0) AS totalDeposits,
-        MAX(CASE WHEN LOWER(cp.status) IN ('paid','payment.paid') THEN 1 ELSE 0 END) AS hasDeposit
+        MAX(CASE WHEN LOWER(cp.status) IN ('paid','payment.paid') THEN 1 ELSE 0 END) AS hasDeposit,
+        vl.name AS vipLevelName,
+        vl.price AS vipPrice,
+        uv.started_at AS vipStartedAt,
+        uv.expires_at AS vipExpiresAt
       FROM referral_tree rt
       LEFT JOIN cashin_payments cp ON cp.user_id = rt.id
+      LEFT JOIN user_vips uv ON uv.user_id = rt.id AND uv.status = 'active'
+      LEFT JOIN vip_levels vl ON vl.id = uv.vip_level_id
       WHERE rt.level = ?
         ${dateFilter}
-      GROUP BY rt.id, rt.name, rt.phone, rt.level, rt.created_at
+      GROUP BY rt.id, rt.name, rt.phone, rt.level, rt.created_at, vl.name, vl.price, uv.started_at, uv.expires_at
       ORDER BY rt.created_at DESC
       `,
       hasDateRange ? [userId, level, startDate, endDate] : [userId, level]
@@ -6071,6 +7168,10 @@ app.get('/api/team/members/:userId', async (req, res) => {
       createdAt: row.createdAt,
       totalDeposits: Number(row.totalDeposits ?? 0),
       hasDeposit: Number(row.hasDeposit ?? 0) === 1,
+      vipLevelName: row.vipLevelName ? String(row.vipLevelName) : null,
+      vipPrice: row.vipPrice ? Number(row.vipPrice) : null,
+      vipStartedAt: row.vipStartedAt ?? null,
+      vipExpiresAt: row.vipExpiresAt ?? null,
     }))
 
     res.json({
@@ -6082,6 +7183,198 @@ app.get('/api/team/members/:userId', async (req, res) => {
   } catch (err) {
     console.error('[team-members]', err)
     res.status(500).json({ ok: false, error: 'Erro ao carregar membros da equipe.' })
+  }
+})
+
+// ─── Task Commissions (comissões de tarefas recebidas dos indicados) ─────────
+app.get('/api/team/task-commissions/:userId', async (req, res) => {
+  const userId = Number(req.params.userId)
+
+  if (!userId || Number.isNaN(userId)) {
+    res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  try {
+    await ensureTaskCommissionPayoutsTable()
+
+    // Resumo por nível: total de comissão recebida e número de pagamentos
+    const [summaryRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        tcp.referral_level AS level,
+        COUNT(*) AS totalPayouts,
+        SUM(tcp.commission_amount) AS totalCommission,
+        tcp.commission_percent AS commissionPercent
+      FROM task_commission_payouts tcp
+      WHERE tcp.beneficiary_user_id = ?
+      GROUP BY tcp.referral_level, tcp.commission_percent
+      ORDER BY tcp.referral_level ASC
+      `,
+      [userId]
+    )
+
+    // Detalhamento: comissões agrupadas por membro que gerou
+    const [memberRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        tcp.task_user_id AS memberId,
+        u.name AS memberName,
+        u.phone AS memberPhone,
+        tcp.referral_level AS level,
+        tcp.commission_percent AS commissionPercent,
+        COUNT(*) AS taskCount,
+        SUM(tcp.base_amount) AS totalBaseAmount,
+        SUM(tcp.commission_amount) AS totalCommission,
+        MAX(tcp.created_at) AS lastCommissionAt
+      FROM task_commission_payouts tcp
+      INNER JOIN users u ON u.id = tcp.task_user_id
+      WHERE tcp.beneficiary_user_id = ?
+      GROUP BY tcp.task_user_id, u.name, u.phone, tcp.referral_level, tcp.commission_percent
+      ORDER BY tcp.referral_level ASC, totalCommission DESC
+      `,
+      [userId]
+    )
+
+    const summary = summaryRows.map((row) => ({
+      level: Number(row.level ?? 0),
+      totalPayouts: Number(row.totalPayouts ?? 0),
+      totalCommission: Number(row.totalCommission ?? 0),
+      commissionPercent: Number(row.commissionPercent ?? 0),
+    }))
+
+    const members = memberRows.map((row) => ({
+      memberId: Number(row.memberId ?? 0),
+      memberName: String(row.memberName ?? 'Usuário'),
+      memberPhone: String(row.memberPhone ?? '-'),
+      level: Number(row.level ?? 0),
+      commissionPercent: Number(row.commissionPercent ?? 0),
+      taskCount: Number(row.taskCount ?? 0),
+      totalBaseAmount: Number(row.totalBaseAmount ?? 0),
+      totalCommission: Number(row.totalCommission ?? 0),
+      lastCommissionAt: row.lastCommissionAt ?? null,
+    }))
+
+    const grandTotal = summary.reduce((acc, s) => acc + s.totalCommission, 0)
+
+    res.json({
+      ok: true,
+      grandTotal,
+      summary,
+      members,
+    })
+  } catch (err) {
+    console.error('[team-task-commissions]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar comissões de tarefas.' })
+  }
+})
+
+// ─── Team VIP Members (membros da equipe que compraram VIP) ──────────────────
+app.get('/api/team/vip-members/:userId', async (req, res) => {
+  const userId = Number(req.params.userId)
+
+  if (!userId || Number.isNaN(userId)) {
+    res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  try {
+    const [users] = await pool.query<RowDataPacket[]>(
+      'SELECT id FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    )
+
+    if (users.length === 0) {
+      res.status(404).json({ ok: false, error: 'Usuário não encontrado.' })
+      return
+    }
+
+    // Busca comissões por nível
+    const [commRows] = await pool.query<RowDataPacket[]>(
+      `SELECT level, commission_percent AS commissionPercent
+       FROM commission_levels
+       WHERE is_active = 1
+       ORDER BY level ASC`
+    )
+
+    const commissionByLevel: Record<number, number> = {}
+    for (const r of commRows) {
+      commissionByLevel[Number(r.level)] = Number(r.commissionPercent ?? 0)
+    }
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      WITH RECURSIVE referral_tree AS (
+        SELECT
+          u.id,
+          u.name,
+          u.phone,
+          u.created_at,
+          1 AS level
+        FROM users u
+        WHERE u.referred_by_user_id = ?
+
+        UNION ALL
+
+        SELECT
+          u2.id,
+          u2.name,
+          u2.phone,
+          u2.created_at,
+          rt.level + 1 AS level
+        FROM users u2
+        INNER JOIN referral_tree rt ON u2.referred_by_user_id = rt.id
+        WHERE rt.level < 3
+      )
+      SELECT
+        rt.id,
+        rt.name,
+        rt.phone,
+        rt.level,
+        rt.created_at AS createdAt,
+        vl.name AS vipLevelName,
+        vl.price AS vipPrice,
+        uv.started_at AS vipStartedAt,
+        uv.expires_at AS vipExpiresAt
+      FROM referral_tree rt
+      INNER JOIN user_vips uv ON uv.user_id = rt.id AND uv.status = 'active'
+      INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
+      WHERE COALESCE(vl.price, 0) > 0
+      ORDER BY rt.level ASC, uv.started_at DESC
+      `,
+      [userId]
+    )
+
+    const members = rows.map((row) => {
+      const level = Number(row.level ?? 1)
+      const vipPrice = Number(row.vipPrice ?? 0)
+      const commPercent = commissionByLevel[level] ?? 0
+      const commissionEarned = (vipPrice * commPercent) / 100
+
+      return {
+        id: Number(row.id),
+        name: String(row.name ?? 'Usuário'),
+        phone: String(row.phone ?? '-'),
+        level,
+        createdAt: row.createdAt,
+        vipLevelName: String(row.vipLevelName ?? ''),
+        vipPrice,
+        vipStartedAt: row.vipStartedAt ?? null,
+        vipExpiresAt: row.vipExpiresAt ?? null,
+        commissionPercent: commPercent,
+        commissionEarned,
+      }
+    })
+
+    res.json({
+      ok: true,
+      total: members.length,
+      commissionLevels: commissionByLevel,
+      members,
+    })
+  } catch (err) {
+    console.error('[team-vip-members]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar membros VIP da equipe.' })
   }
 })
 
@@ -6263,10 +7556,12 @@ app.post('/api/roleta/spin', spinLimiter, requireAuth, async (req: Authenticated
     await conn.query(
       `
       UPDATE users
-      SET balance = COALESCE(balance, 0) + ?
+      SET
+        balance = COALESCE(balance, 0) + ?,
+        commission_balance = COALESCE(commission_balance, 0) + ?
       WHERE id = ?
       `,
-      [fixedPrizeAmount, parsedUserId]
+      [fixedPrizeAmount, fixedPrizeAmount, parsedUserId]
     )
 
     await conn.query(
@@ -7018,10 +8313,12 @@ app.post('/api/checkin/claim', requireAuth, async (req: AuthenticatedRequest, re
     await conn.query(
       `
       UPDATE users
-      SET balance = COALESCE(balance, 0) + ?
+      SET
+        balance = COALESCE(balance, 0) + ?,
+        commission_balance = COALESCE(commission_balance, 0) + ?
       WHERE id = ?
       `,
-      [rewardAmount, parsedUserId]
+      [rewardAmount, rewardAmount, parsedUserId]
     )
 
     const [updatedRows] = await conn.query<RowDataPacket[]>(
@@ -7918,36 +9215,7 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
     )
     const shouldAutoApproveEarly = Number(earlyConfigRows[0]?.withdrawAutoApprove ?? 0) === 1
 
-    await ensureWithdrawActivationTokensTable()
-
     let activationTokenId = 0
-    if (!shouldAutoApproveEarly) {
-      const [activationRows] = await conn.query<RowDataPacket[]>(
-        `
-        SELECT id
-        FROM withdraw_activation_tokens
-        WHERE user_id = ?
-          AND status = 'activated'
-          AND activated_at IS NOT NULL
-          AND activated_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-        ORDER BY activated_at DESC, id DESC
-        LIMIT 1
-        FOR UPDATE
-        `,
-        [parsedUserId]
-      )
-
-      if (activationRows.length === 0) {
-        await conn.rollback()
-        res.status(400).json({
-          ok: false,
-          error: 'Saque não ativado. Envie no grupo permitido: "Ative o saque para mim: TOKEN".',
-        })
-        return
-      }
-
-      activationTokenId = Number(activationRows[0].id ?? 0)
-    }
 
     const [openWithdrawRows] = await conn.query<RowDataPacket[]>(
       `
@@ -8171,10 +9439,16 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
     await conn.query(
       `
       UPDATE users
-      SET balance = ?
+      SET
+        balance = ?,
+        commission_balance = GREATEST(COALESCE(commission_balance, 0) - ?, 0),
+        recharge_balance = GREATEST(
+          COALESCE(recharge_balance, 0) - GREATEST(? - COALESCE(commission_balance, 0), 0),
+          0
+        )
       WHERE id = ?
       `,
-      [newBalance, parsedUserId]
+      [newBalance, safeAmount, safeAmount, parsedUserId]
     )
 
     const externalId = `WD-${Date.now()}-${parsedUserId}`
@@ -8302,6 +9576,9 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
     )
 
     await conn.commit()
+
+    // Emite saldo atualizado via WebSocket
+    emitBalanceUpdate(parsedUserId)
 
     res.json({
       ok: true,
@@ -8576,10 +9853,12 @@ app.post('/api/withdraw/webhook', async (req, res) => {
         await conn.query(
           `
           UPDATE users
-          SET balance = COALESCE(balance, 0) + ?
+          SET
+            balance = COALESCE(balance, 0) + ?,
+            commission_balance = COALESCE(commission_balance, 0) + ?
           WHERE id = ?
           `,
-          [withdrawalAmount, userId]
+          [withdrawalAmount, withdrawalAmount, userId]
         )
         console.log('[withdraw-webhook] estorno realizado', {
           withdrawalId,
@@ -8671,6 +9950,9 @@ const ensureCycleProductsTable = async () => {
   await tryAlter(`ALTER TABLE cycle_products ADD COLUMN require_commission_level_2_count INT NOT NULL DEFAULT 0`)
   await tryAlter(`ALTER TABLE cycle_products ADD COLUMN require_commission_level_3_count INT NOT NULL DEFAULT 0`)
   await tryAlter(`ALTER TABLE cycle_products ADD COLUMN max_purchases_per_user INT NOT NULL DEFAULT 0`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN min_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN max_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN profit_percent DECIMAL(8,4) NOT NULL DEFAULT 0.0000`)
 }
 
 type CommissionLevelRequirementInput = {
@@ -8849,7 +10131,7 @@ const ensureVipAndMiningTables = async () => {
       name VARCHAR(80) NOT NULL,
       price DECIMAL(12,2) NOT NULL DEFAULT 0.00,
       daily_task_limit INT NOT NULL DEFAULT 0,
-      task_reward_multiplier DECIMAL(10,2) NOT NULL DEFAULT 1.00,
+      task_reward_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
       benefits TEXT NULL,
       is_active TINYINT(1) NOT NULL DEFAULT 1,
       sort_order INT NOT NULL DEFAULT 0,
@@ -8859,6 +10141,97 @@ const ensureVipAndMiningTables = async () => {
     )
     `
   )
+
+  // Migração: renomear task_reward_multiplier -> task_reward_amount se ainda existir
+  await migrateVipLevelsRewardColumn()
+
+  // Migração: adicionar coluna image_url se não existir
+  try {
+    const [imgCols] = await pool.query<RowDataPacket[]>(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vip_levels' AND COLUMN_NAME = 'image_url'`
+    )
+    if (!Array.isArray(imgCols) || imgCols.length === 0) {
+      await pool.query(`ALTER TABLE vip_levels ADD COLUMN image_url VARCHAR(500) NULL DEFAULT NULL AFTER benefits`)
+      console.log('[migrate] vip_levels: image_url adicionada')
+    }
+  } catch (err) {
+    console.error('[migrate-vip-image-url]', err)
+  }
+
+  // Migração: adicionar coluna avatar_url (foto do perfil do usuário, separada da image_url do produto)
+  try {
+    const [avCols] = await pool.query<RowDataPacket[]>(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vip_levels' AND COLUMN_NAME = 'avatar_url'`
+    )
+    if (!Array.isArray(avCols) || avCols.length === 0) {
+      await pool.query(`ALTER TABLE vip_levels ADD COLUMN avatar_url VARCHAR(500) NULL DEFAULT NULL AFTER image_url`)
+      console.log('[migrate] vip_levels: avatar_url adicionada')
+    }
+  } catch (err) {
+    console.error('[migrate-vip-avatar-url]', err)
+  }
+
+  // Migração: adicionar coluna duration_days se não existir (default 365 dias)
+  try {
+    const [durCols] = await pool.query<RowDataPacket[]>(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vip_levels' AND COLUMN_NAME = 'duration_days'`
+    )
+    if (!Array.isArray(durCols) || durCols.length === 0) {
+      await pool.query(`ALTER TABLE vip_levels ADD COLUMN duration_days INT NOT NULL DEFAULT 365 AFTER task_reward_amount`)
+      console.log('[migrate] vip_levels: duration_days adicionada')
+    }
+  } catch (err) {
+    console.error('[migrate-vip-duration-days]', err)
+  }
+
+  // Migração: adicionar coluna is_default (qual VIP é dado automaticamente no cadastro)
+  try {
+    const [defCols] = await pool.query<RowDataPacket[]>(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vip_levels' AND COLUMN_NAME = 'is_default'`
+    )
+    if (!Array.isArray(defCols) || defCols.length === 0) {
+      await pool.query(`ALTER TABLE vip_levels ADD COLUMN is_default TINYINT(1) NOT NULL DEFAULT 0 AFTER is_active`)
+      console.log('[migrate] vip_levels: is_default adicionada')
+
+      // Marca o VIP T0 (id=6) como padrão se existir, senão marca o de menor preço/ordem
+      const [t0Rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id FROM vip_levels WHERE id = 6 LIMIT 1`
+      )
+      if (Array.isArray(t0Rows) && t0Rows.length > 0) {
+        await pool.query(`UPDATE vip_levels SET is_default = 1 WHERE id = 6`)
+      } else {
+        const [fallbackRows] = await pool.query<RowDataPacket[]>(
+          `SELECT id FROM vip_levels ORDER BY price ASC, sort_order ASC, id ASC LIMIT 1`
+        )
+        if (Array.isArray(fallbackRows) && fallbackRows.length > 0) {
+          await pool.query(`UPDATE vip_levels SET is_default = 1 WHERE id = ?`, [Number(fallbackRows[0].id)])
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[migrate-vip-is-default]', err)
+  }
+
+  // Migração: adicionar colunas require_commission_level_*_count (requisitos de convite para comprar VIP)
+  for (const col of ['require_commission_level_1_count', 'require_commission_level_2_count', 'require_commission_level_3_count']) {
+    try {
+      const [cols] = await pool.query<RowDataPacket[]>(
+        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vip_levels' AND COLUMN_NAME = ?`,
+        [col]
+      )
+      if (!Array.isArray(cols) || cols.length === 0) {
+        await pool.query(`ALTER TABLE vip_levels ADD COLUMN \`${col}\` INT NOT NULL DEFAULT 0`)
+        console.log(`[migrate] vip_levels: ${col} adicionada`)
+      }
+    } catch (err) {
+      console.error(`[migrate-vip-${col}]`, err)
+    }
+  }
 
   await pool.query(
     `
@@ -8906,13 +10279,13 @@ const ensureVipAndMiningTables = async () => {
     await pool.query(
       `
       INSERT INTO vip_levels
-        (name, price, daily_task_limit, task_reward_multiplier, benefits, is_active, sort_order)
+        (name, price, daily_task_limit, task_reward_amount, benefits, is_active, sort_order)
       VALUES
-        ('VIP 1', 29.90, 5, 1.10, 'Acesso básico às tarefas VIP', 1, 1),
-        ('VIP 2', 59.90, 10, 1.20, 'Limite diário maior + prioridade padrão', 1, 2),
-        ('VIP 3', 99.90, 20, 1.35, 'Bônus de comissão intermediário', 1, 3),
-        ('VIP 4', 199.90, 35, 1.50, 'Comissão avançada e suporte prioritário', 1, 4),
-        ('VIP 5', 399.90, 60, 2.00, 'Plano máximo com maiores ganhos', 1, 5)
+        ('VIP 1', 29.90, 5, 1.00, 'Acesso básico às tarefas VIP', 1, 1),
+        ('VIP 2', 59.90, 10, 2.00, 'Limite diário maior + prioridade padrão', 1, 2),
+        ('VIP 3', 99.90, 20, 3.50, 'Bônus de comissão intermediário', 1, 3),
+        ('VIP 4', 199.90, 35, 5.00, 'Comissão avançada e suporte prioritário', 1, 4),
+        ('VIP 5', 399.90, 60, 8.00, 'Plano máximo com maiores ganhos', 1, 5)
       `
     )
   }
@@ -8995,6 +10368,209 @@ const ensureCommissionPayoutsTable = async () => {
     )
     `
   )
+}
+
+const ensureTaskCommissionPayoutsTable = async () => {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS task_commission_payouts (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      task_progress_id BIGINT UNSIGNED NOT NULL COMMENT 'ID do user_mining_task_progress',
+      task_user_id BIGINT UNSIGNED NOT NULL COMMENT 'Usuário que completou a tarefa',
+      beneficiary_user_id BIGINT UNSIGNED NOT NULL COMMENT 'Quem recebeu a comissão (upline)',
+      referral_level TINYINT UNSIGNED NOT NULL COMMENT '1, 2 ou 3',
+      commission_percent DECIMAL(8,2) NOT NULL DEFAULT 0.00,
+      base_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT 'Recompensa da tarefa',
+      commission_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      progress_date DATE NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_task_comm_unique (task_progress_id, beneficiary_user_id, referral_level),
+      KEY idx_task_comm_task_user (task_user_id),
+      KEY idx_task_comm_beneficiary (beneficiary_user_id),
+      KEY idx_task_comm_date (progress_date)
+    )
+    `
+  )
+}
+
+const applyReferralCommissionsForTask = async (
+  taskProgressId: number,
+  taskUserId: number,
+  rewardAmount: number,
+  progressDate: string
+) => {
+  const parsedProgressId = Number(taskProgressId)
+  const parsedTaskUserId = Number(taskUserId)
+  const parsedRewardAmount = Number(rewardAmount)
+
+  if (!parsedProgressId || Number.isNaN(parsedProgressId)) return
+  if (!parsedTaskUserId || Number.isNaN(parsedTaskUserId)) return
+  if (!Number.isFinite(parsedRewardAmount) || parsedRewardAmount <= 0) return
+
+  const conn = await pool.getConnection()
+  try {
+    await conn.beginTransaction()
+
+    await ensureCommissionLevelsTable()
+    await ensureTaskCommissionPayoutsTable()
+
+    const [levelRows] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT
+        level,
+        commission_percent AS commissionPercent,
+        is_active AS isActive
+      FROM commission_levels
+      WHERE level BETWEEN 1 AND 3
+      ORDER BY level ASC
+      `
+    )
+
+    const activeLevels = levelRows
+      .map((row) => ({
+        level: Number(row.level ?? 0),
+        commissionPercent: Number(row.commissionPercent ?? 0),
+        isActive: Number(row.isActive ?? 0) === 1,
+      }))
+      .filter((item) => item.isActive && item.level >= 1 && item.level <= 3 && item.commissionPercent > 0)
+
+    if (activeLevels.length === 0) {
+      await conn.commit()
+      return
+    }
+
+    let currentUserId = parsedTaskUserId
+
+    for (let level = 1; level <= 3; level += 1) {
+      const [uplineRows] = await conn.query<RowDataPacket[]>(
+        `
+        SELECT referred_by_user_id AS referredByUserId
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [currentUserId]
+      )
+
+      if (uplineRows.length === 0) break
+
+      const parentUserId = Number(uplineRows[0].referredByUserId ?? 0)
+      if (!parentUserId || Number.isNaN(parentUserId)) break
+
+      const levelConfig = activeLevels.find((item) => item.level === level)
+      if (levelConfig) {
+        const commissionAmount = Number((parsedRewardAmount * (levelConfig.commissionPercent / 100)).toFixed(2))
+        if (commissionAmount > 0) {
+          const [existingRows] = await conn.query<RowDataPacket[]>(
+            `
+            SELECT id
+            FROM task_commission_payouts
+            WHERE task_progress_id = ?
+              AND beneficiary_user_id = ?
+              AND referral_level = ?
+            LIMIT 1
+            FOR UPDATE
+            `,
+            [parsedProgressId, parentUserId, level]
+          )
+
+          if (existingRows.length === 0) {
+            await conn.query(
+              `
+              INSERT INTO task_commission_payouts
+              (
+                task_progress_id,
+                task_user_id,
+                beneficiary_user_id,
+                referral_level,
+                commission_percent,
+                base_amount,
+                commission_amount,
+                progress_date
+              )
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              `,
+              [
+                parsedProgressId,
+                parsedTaskUserId,
+                parentUserId,
+                level,
+                Number(levelConfig.commissionPercent.toFixed(2)),
+                Number(parsedRewardAmount.toFixed(2)),
+                commissionAmount,
+                progressDate,
+              ]
+            )
+
+            // Captura saldo de comissão anterior para log
+            const [oldCommBalRows] = await conn.query<RowDataPacket[]>(
+              'SELECT COALESCE(commission_balance, 0) AS commissionBalance FROM users WHERE id = ? LIMIT 1',
+              [parentUserId]
+            )
+            const oldCommissionBalance = Number(oldCommBalRows[0]?.commissionBalance ?? 0)
+            const newCommissionBalance = Number((oldCommissionBalance + commissionAmount).toFixed(2))
+
+            await conn.query(
+              `
+              UPDATE users
+              SET
+                commission_balance = COALESCE(commission_balance, 0) + ?
+              WHERE id = ?
+              `,
+              [commissionAmount, parentUserId]
+            )
+
+            await conn.query(
+              `
+              INSERT INTO logs
+              (
+                user_id,
+                entity_type,
+                entity_id,
+                action,
+                old_balance,
+                new_balance,
+                amount,
+                metadata
+              )
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              `,
+              [
+                parentUserId,
+                'task_commission',
+                parsedProgressId,
+                'task_commission_credit',
+                Number(oldCommissionBalance.toFixed(2)),
+                newCommissionBalance,
+                commissionAmount,
+                JSON.stringify({
+                  taskProgressId: parsedProgressId,
+                  taskUserId: parsedTaskUserId,
+                  beneficiaryUserId: parentUserId,
+                  level,
+                  commissionPercent: Number(levelConfig.commissionPercent.toFixed(2)),
+                  baseAmount: Number(parsedRewardAmount.toFixed(2)),
+                  progressDate,
+                  creditedTo: 'commission_balance',
+                }),
+              ]
+            )
+          }
+        }
+      }
+
+      currentUserId = parentUserId
+    }
+
+    await conn.commit()
+  } catch (err) {
+    await conn.rollback()
+    console.error('[task-referral-commission]', err)
+  } finally {
+    conn.release()
+  }
 }
 
 const ensureMonthlySalaryPlansTable = async () => {
@@ -9216,7 +10792,8 @@ const applyReferralCommissionsForDeposit = async (cashinPaymentId: number, depos
             await conn.query(
               `
               UPDATE users
-              SET balance = COALESCE(balance, 0) + ?
+              SET
+                commission_balance = COALESCE(commission_balance, 0) + ?
               WHERE id = ?
               `,
               [commissionAmount, parentUserId]
@@ -9285,6 +10862,156 @@ const applyReferralCommissionsForDeposit = async (cashinPaymentId: number, depos
   } catch (err) {
     await conn.rollback()
     throw err
+  } finally {
+    conn.release()
+  }
+}
+
+// ─── Comissão por compra de VIP ──────────────────────────────────────────────
+const applyReferralCommissionsForVipPurchase = async (
+  buyerUserId: number,
+  vipLevelPrice: number,
+  vipPurchaseHistoryId: number
+) => {
+  if (!buyerUserId || !Number.isFinite(vipLevelPrice) || vipLevelPrice <= 0) return
+
+  const conn = await pool.getConnection()
+  try {
+    await conn.beginTransaction()
+
+    await ensureCommissionLevelsTable()
+
+    const [levelRows] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT
+        level,
+        commission_percent AS commissionPercent,
+        is_active AS isActive
+      FROM commission_levels
+      WHERE level BETWEEN 1 AND 3
+      ORDER BY level ASC
+      `
+    )
+
+    const activeLevels = levelRows
+      .map((row) => ({
+        level: Number(row.level ?? 0),
+        commissionPercent: Number(row.commissionPercent ?? 0),
+        isActive: Number(row.isActive ?? 0) === 1,
+      }))
+      .filter((item) => item.isActive && item.level >= 1 && item.level <= 3 && item.commissionPercent > 0)
+
+    if (activeLevels.length === 0) {
+      await conn.commit()
+      return
+    }
+
+    let currentUserId = buyerUserId
+    const beneficiaryIds: number[] = []
+
+    for (let level = 1; level <= 3; level += 1) {
+      const [uplineRows] = await conn.query<RowDataPacket[]>(
+        `
+        SELECT referred_by_user_id AS referredByUserId
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [currentUserId]
+      )
+
+      if (uplineRows.length === 0) break
+
+      const parentUserId = Number(uplineRows[0].referredByUserId ?? 0)
+      if (!parentUserId || Number.isNaN(parentUserId)) break
+
+      const levelConfig = activeLevels.find((item) => item.level === level)
+      if (levelConfig) {
+        const commissionAmount = Number((vipLevelPrice * (levelConfig.commissionPercent / 100)).toFixed(2))
+        if (commissionAmount > 0) {
+          // Credita comissão APENAS no commission_balance do upline
+          await conn.query(
+            `
+            UPDATE users
+            SET
+              commission_balance = COALESCE(commission_balance, 0) + ?
+            WHERE id = ?
+            `,
+            [commissionAmount, parentUserId]
+          )
+
+          beneficiaryIds.push(parentUserId)
+
+          // Log da comissão
+          await conn.query(
+            `
+            CREATE TABLE IF NOT EXISTS logs (
+              id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+              user_id BIGINT UNSIGNED NULL,
+              entity_type VARCHAR(60) NOT NULL,
+              entity_id BIGINT UNSIGNED NULL,
+              action VARCHAR(100) NOT NULL,
+              old_balance DECIMAL(12,2) NULL,
+              new_balance DECIMAL(12,2) NULL,
+              amount DECIMAL(12,2) NULL,
+              metadata JSON NULL,
+              created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY (id),
+              KEY idx_logs_user_id (user_id),
+              KEY idx_logs_entity_type (entity_type),
+              KEY idx_logs_entity_id (entity_id),
+              KEY idx_logs_action (action),
+              KEY idx_logs_created_at (created_at)
+            )
+            `
+          )
+
+          await conn.query(
+            `
+            INSERT INTO logs
+            (
+              user_id,
+              entity_type,
+              entity_id,
+              action,
+              amount,
+              metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            `,
+            [
+              parentUserId,
+              'vip_commission',
+              vipPurchaseHistoryId,
+              'vip_commission_credit',
+              commissionAmount,
+              JSON.stringify({
+                buyerUserId,
+                beneficiaryUserId: parentUserId,
+                level,
+                commissionPercent: Number(levelConfig.commissionPercent.toFixed(2)),
+                vipPrice: Number(vipLevelPrice.toFixed(2)),
+                commissionAmount,
+              }),
+            ]
+          )
+        }
+      }
+
+      currentUserId = parentUserId
+    }
+
+    await conn.commit()
+    console.log(`[vip-commission] Comissões distribuídas para compra VIP do user ${buyerUserId}`)
+
+    // Emite saldo atualizado via WebSocket para cada upline que recebeu comissão
+    for (const uid of beneficiaryIds) {
+      emitBalanceUpdate(uid)
+    }
+  } catch (err) {
+    await conn.rollback()
+    console.error('[vip-commission]', err)
   } finally {
     conn.release()
   }
@@ -10190,10 +11917,12 @@ app.post('/api/gift-codes/redeem', requireAuth, async (req: AuthenticatedRequest
       await conn.query(
         `
         UPDATE users
-        SET balance = COALESCE(balance, 0) + ?
+        SET
+          balance = COALESCE(balance, 0) + ?,
+          commission_balance = COALESCE(commission_balance, 0) + ?
         WHERE id = ?
         `,
-        [rewardValue, parsedUserId]
+        [rewardValue, rewardValue, parsedUserId]
       )
     }
 
@@ -10259,6 +11988,9 @@ app.post('/api/gift-codes/redeem', requireAuth, async (req: AuthenticatedRequest
     )
 
     await conn.commit()
+
+    // Emite saldo atualizado via WebSocket
+    emitBalanceUpdate(parsedUserId)
 
     res.json({
       ok: true,
@@ -10393,6 +12125,83 @@ app.get('/api/referral/commission-levels', async (req, res) => {
       request: debugRequestInfo,
     })
     res.status(500).json({ ok: false, error: 'Erro ao carregar níveis de comissão.' })
+  }
+})
+
+// ─── Estatísticas de comissões VIP recebidas pelo usuário (por nível) ───────
+// Retorna: por nível (1, 2, 3): quantos uplines compraram VIP e total de comissão recebida.
+app.get('/api/referral/vip-commissions/:userId', async (req, res) => {
+  const userId = Number(req.params.userId)
+
+  if (!userId || Number.isNaN(userId)) {
+    res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  try {
+    // Busca configuração de comissões por nível
+    const [commRows] = await pool.query<RowDataPacket[]>(
+      `SELECT level, commission_percent AS commissionPercent
+       FROM commission_levels
+       WHERE is_active = 1
+       ORDER BY level ASC`
+    )
+    const commissionByLevel: Record<number, number> = {}
+    for (const r of commRows) {
+      commissionByLevel[Number(r.level)] = Number(r.commissionPercent ?? 0)
+    }
+
+    // Busca todos os logs de comissão VIP em que este usuário foi beneficiário
+    const [logRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT id, amount, metadata
+      FROM logs
+      WHERE user_id = ?
+        AND action = 'vip_commission_credit'
+      `,
+      [userId]
+    )
+
+    const summaryByLevel: Record<number, { level: number; buyersCount: number; totalCommission: number; commissionPercent: number }> = {
+      1: { level: 1, buyersCount: 0, totalCommission: 0, commissionPercent: commissionByLevel[1] ?? 0 },
+      2: { level: 2, buyersCount: 0, totalCommission: 0, commissionPercent: commissionByLevel[2] ?? 0 },
+      3: { level: 3, buyersCount: 0, totalCommission: 0, commissionPercent: commissionByLevel[3] ?? 0 },
+    }
+
+    // Para evitar contar o mesmo comprador várias vezes (caso compre VIP múltiplas vezes), agrupa por buyerUserId
+    const buyersByLevel: Record<number, Set<number>> = { 1: new Set(), 2: new Set(), 3: new Set() }
+
+    let grandTotal = 0
+    for (const log of logRows) {
+      try {
+        const meta = typeof log.metadata === 'string' ? JSON.parse(log.metadata) : log.metadata
+        const level = Number(meta?.level ?? 0)
+        const buyer = Number(meta?.buyerUserId ?? 0)
+        const amount = Number(log.amount ?? 0)
+
+        if (level >= 1 && level <= 3) {
+          summaryByLevel[level].totalCommission += amount
+          if (buyer > 0) buyersByLevel[level].add(buyer)
+          grandTotal += amount
+        }
+      } catch {
+        // ignora log com metadata inválido
+      }
+    }
+
+    for (const lv of [1, 2, 3]) {
+      summaryByLevel[lv].buyersCount = buyersByLevel[lv].size
+      summaryByLevel[lv].totalCommission = Number(summaryByLevel[lv].totalCommission.toFixed(2))
+    }
+
+    res.json({
+      ok: true,
+      grandTotal: Number(grandTotal.toFixed(2)),
+      levels: [summaryByLevel[1], summaryByLevel[2], summaryByLevel[3]],
+    })
+  } catch (err) {
+    console.error('[referral-vip-commissions]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar comissões VIP.' })
   }
 })
 
@@ -10546,6 +12355,82 @@ app.post('/api/admin/commission-levels', requireMaxAdmin, async (req, res) => {
     res.status(500).json({ ok: false, error: 'Erro ao salvar níveis de comissão.' })
   } finally {
     conn.release()
+  }
+})
+
+// ── Admin: Comissões de Tarefas (payouts) ──────────────────────────────
+app.get('/api/admin/task-commission-payouts', requireMaxAdmin, async (req, res) => {
+  try {
+    await ensureTaskCommissionPayoutsTable()
+
+    const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500)
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        tcp.id,
+        tcp.task_progress_id  AS taskProgressId,
+        tcp.task_user_id      AS taskUserId,
+        tu.name               AS taskUserName,
+        tu.phone              AS taskUserPhone,
+        tcp.beneficiary_user_id AS beneficiaryUserId,
+        bu.name               AS beneficiaryName,
+        bu.phone              AS beneficiaryPhone,
+        tcp.referral_level    AS referralLevel,
+        tcp.commission_percent AS commissionPercent,
+        tcp.base_amount       AS baseAmount,
+        tcp.commission_amount AS commissionAmount,
+        tcp.progress_date     AS progressDate,
+        tcp.created_at        AS createdAt
+      FROM task_commission_payouts tcp
+      LEFT JOIN users tu ON tu.id = tcp.task_user_id
+      LEFT JOIN users bu ON bu.id = tcp.beneficiary_user_id
+      ORDER BY tcp.created_at DESC
+      LIMIT ?
+      `,
+      [limit]
+    )
+
+    const payouts = rows.map((row) => ({
+      id: Number(row.id),
+      taskProgressId: Number(row.taskProgressId ?? 0),
+      taskUserId: Number(row.taskUserId ?? 0),
+      taskUserName: String(row.taskUserName ?? ''),
+      taskUserPhone: String(row.taskUserPhone ?? ''),
+      beneficiaryUserId: Number(row.beneficiaryUserId ?? 0),
+      beneficiaryName: String(row.beneficiaryName ?? ''),
+      beneficiaryPhone: String(row.beneficiaryPhone ?? ''),
+      referralLevel: Number(row.referralLevel ?? 0),
+      commissionPercent: Number(row.commissionPercent ?? 0),
+      baseAmount: Number(row.baseAmount ?? 0),
+      commissionAmount: Number(row.commissionAmount ?? 0),
+      progressDate: String(row.progressDate ?? ''),
+      createdAt: row.createdAt ?? null,
+    }))
+
+    // Totais por nível
+    const [summaryRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        referral_level AS referralLevel,
+        COUNT(*) AS totalPayouts,
+        SUM(commission_amount) AS totalAmount
+      FROM task_commission_payouts
+      GROUP BY referral_level
+      ORDER BY referral_level ASC
+      `
+    )
+
+    const summary = summaryRows.map((row) => ({
+      referralLevel: Number(row.referralLevel ?? 0),
+      totalPayouts: Number(row.totalPayouts ?? 0),
+      totalAmount: Number(row.totalAmount ?? 0),
+    }))
+
+    res.json({ ok: true, payouts, summary })
+  } catch (err) {
+    console.error('[admin-task-commission-payouts]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao listar comissões de tarefas.' })
   }
 })
 
@@ -12066,18 +13951,23 @@ app.post('/api/admin/deposits/:id/action', requireMaxAdmin, async (req, res) => 
           UPDATE users
           SET
             balance = COALESCE(balance, 0) + ?,
+            recharge_balance = COALESCE(recharge_balance, 0) + ?,
             total_deposits = COALESCE(total_deposits, 0) + ?
           WHERE id = ?
           `,
-          [amount, amount, userId]
+          [amount, amount, amount, userId]
         )
       }
 
       await conn.commit()
 
+      // Comissão por depósito removida – comissão agora é por compra de VIP
+
+      // Emite saldo atualizado via WebSocket
       if (!isCurrentlyPaid) {
-        await applyReferralCommissionsForDeposit(depositId, userId, amount)
+        emitBalanceUpdate(userId)
       }
+
       res.json({
         ok: true,
         message: isCurrentlyPaid ? 'Depósito já estava aprovado.' : 'Depósito aprovado e saldo creditado.',
@@ -12524,10 +14414,12 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
       await conn.query(
         `
         UPDATE users
-        SET balance = COALESCE(balance, 0) + ?
+        SET
+          balance = COALESCE(balance, 0) + ?,
+          commission_balance = COALESCE(commission_balance, 0) + ?
         WHERE id = ?
         `,
-        [amount, userId]
+        [amount, amount, userId]
       )
       refunded = true
     }
@@ -12634,6 +14526,45 @@ app.post('/api/admin/migrate-balance-columns', requireMaxAdmin, async (_req: Aut
       )
     }
 
+    // Garante colunas das carteiras (comissão e recarga)
+    const [rechargeCols] = await pool.query<RowDataPacket[]>(
+      "SHOW COLUMNS FROM users LIKE 'recharge_balance'"
+    )
+    if (rechargeCols.length === 0) {
+      await pool.query(
+        'ALTER TABLE users ADD COLUMN recharge_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00'
+      )
+      // Inicializa a carteira de recarga com o total já depositado
+      await pool.query(
+        'UPDATE users SET recharge_balance = COALESCE(total_deposits, 0) WHERE recharge_balance = 0'
+      )
+    }
+
+    const [commissionCols] = await pool.query<RowDataPacket[]>(
+      "SHOW COLUMNS FROM users LIKE 'commission_balance'"
+    )
+    if (commissionCols.length === 0) {
+      await pool.query(
+        'ALTER TABLE users ADD COLUMN commission_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00'
+      )
+      // Inicializa a carteira de comissão com a diferença entre saldo atual e depósitos
+      await pool.query(
+        'UPDATE users SET commission_balance = GREATEST(COALESCE(balance, 0) - COALESCE(total_deposits, 0), 0) WHERE commission_balance = 0'
+      )
+    }
+
+    // Garante coluna badge (padrão: Estagiário para todos usuários)
+    const [badgeCols] = await pool.query<RowDataPacket[]>(
+      "SHOW COLUMNS FROM users LIKE 'badge'"
+    )
+    if (badgeCols.length === 0) {
+      await pool.query(
+        "ALTER TABLE users ADD COLUMN badge VARCHAR(50) NOT NULL DEFAULT 'Estagiário'"
+      )
+      // Atribui a badge a usuários já existentes
+      await pool.query("UPDATE users SET badge = 'Estagiário' WHERE badge IS NULL OR badge = ''")
+    }
+
     await pool.query(
       `
       CREATE TABLE IF NOT EXISTS cashin_payments (
@@ -12698,7 +14629,7 @@ app.post('/api/admin/migrate-balance-columns', requireMaxAdmin, async (_req: Aut
         name VARCHAR(80) NOT NULL,
         price DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         daily_task_limit INT NOT NULL DEFAULT 0,
-        task_reward_multiplier DECIMAL(10,2) NOT NULL DEFAULT 1.00,
+        task_reward_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
         benefits TEXT NULL,
         is_active TINYINT(1) NOT NULL DEFAULT 1,
         sort_order INT NOT NULL DEFAULT 0,
@@ -12708,6 +14639,9 @@ app.post('/api/admin/migrate-balance-columns', requireMaxAdmin, async (_req: Aut
       )
       `
     )
+
+    // Migração: renomear task_reward_multiplier -> task_reward_amount se ainda existir
+    await migrateVipLevelsRewardColumn()
 
     await pool.query(
       `
@@ -12786,13 +14720,13 @@ app.post('/api/admin/migrate-balance-columns', requireMaxAdmin, async (_req: Aut
       await pool.query(
         `
         INSERT INTO vip_levels
-          (name, price, daily_task_limit, task_reward_multiplier, benefits, is_active, sort_order)
+          (name, price, daily_task_limit, task_reward_amount, benefits, is_active, sort_order)
         VALUES
-          ('VIP 1', 29.90, 5, 1.10, 'Acesso básico às tarefas VIP', 1, 1),
-          ('VIP 2', 59.90, 10, 1.20, 'Limite diário maior + prioridade padrão', 1, 2),
-          ('VIP 3', 99.90, 20, 1.35, 'Bônus de comissão intermediário', 1, 3),
-          ('VIP 4', 199.90, 35, 1.50, 'Comissão avançada e suporte prioritário', 1, 4),
-          ('VIP 5', 399.90, 60, 2.00, 'Plano máximo com maiores ganhos', 1, 5)
+          ('VIP 1', 29.90, 5, 1.00, 'Acesso básico às tarefas VIP', 1, 1),
+          ('VIP 2', 59.90, 10, 2.00, 'Limite diário maior + prioridade padrão', 1, 2),
+          ('VIP 3', 99.90, 20, 3.50, 'Bônus de comissão intermediário', 1, 3),
+          ('VIP 4', 199.90, 35, 5.00, 'Comissão avançada e suporte prioritário', 1, 4),
+          ('VIP 5', 399.90, 60, 8.00, 'Plano máximo com maiores ganhos', 1, 5)
         `
       )
     }
@@ -14813,8 +16747,8 @@ app.post('/api/caixas-box/open', requireAuth, async (req: AuthenticatedRequest, 
 
     if (picked.type === 'cash' && picked.value > 0) {
       await conn.query(
-        `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE id = ?`,
-        [picked.value, parsedUserId]
+        `UPDATE users SET balance = COALESCE(balance, 0) + ?, commission_balance = COALESCE(commission_balance, 0) + ? WHERE id = ?`,
+        [picked.value, picked.value, parsedUserId]
       )
     }
 
@@ -15669,6 +17603,38 @@ app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ ok: false, error: 'Erro interno do servidor.' })
 })
 
+// ─── Helper: emite saldos atualizados via WebSocket ──────────────────────────
+const emitBalanceUpdate = async (userId: number) => {
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        COALESCE(balance, 0) AS balance,
+        COALESCE(commission_balance, 0) AS commissionBalance,
+        COALESCE(recharge_balance, 0) AS rechargeBalance,
+        COALESCE(total_deposits, 0) AS totalDeposits
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+      `,
+      [userId]
+    )
+    if (rows.length === 0) return
+
+    const data = {
+      userId,
+      balance: Number(rows[0].balance ?? 0),
+      commissionBalance: Number(rows[0].commissionBalance ?? 0),
+      rechargeBalance: Number(rows[0].rechargeBalance ?? 0),
+      totalDeposits: Number(rows[0].totalDeposits ?? 0),
+    }
+
+    io.to(`user:${userId}`).emit('balance:update', data)
+  } catch (err) {
+    console.error('[ws-balance-update]', err)
+  }
+}
+
 io.on('connection', (socket) => {
   console.log(`[ws] client connected: ${socket.id}`)
 
@@ -15689,6 +17655,14 @@ io.on('connection', (socket) => {
     const userId = Number(payload?.userId ?? 0)
     if (!userId || Number.isNaN(userId)) return
     socket.join(`user:${userId}`)
+  })
+
+  socket.on('balance:subscribe', (payload: { userId?: number }) => {
+    const userId = Number(payload?.userId ?? 0)
+    if (!userId || Number.isNaN(userId)) return
+    socket.join(`user:${userId}`)
+    // Envia saldos atuais imediatamente
+    emitBalanceUpdate(userId)
   })
 
   socket.on('disconnect', () => {
