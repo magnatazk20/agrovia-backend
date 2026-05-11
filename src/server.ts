@@ -134,17 +134,6 @@ const resolveAuthUser = async (req: Request) => {
   if (!token) return null
 
   try {
-    await pool.query(
-      `
-      ALTER TABLE users
-      ADD COLUMN is_admin TINYINT(1) NOT NULL DEFAULT 0
-      `
-    )
-  } catch {
-    // coluna já existe
-  }
-
-  try {
     const decoded = jwt.verify(token, JWT_SECRET) as JwtPayload
     const userId = Number(decoded?.id)
     if (!userId || Number.isNaN(userId)) return null
@@ -637,11 +626,10 @@ const claimCheckinForUser = async (userId: number) => {
       `
       UPDATE users
       SET
-        balance = COALESCE(balance, 0) + ?,
-        commission_balance = COALESCE(commission_balance, 0) + ?
+        balance = COALESCE(balance, 0) + ?
       WHERE id = ?
       `,
-      [rewardAmount, rewardAmount, parsedUserId]
+      [rewardAmount, parsedUserId]
     )
 
     const [updatedRows] = await conn.query<RowDataPacket[]>(
@@ -1814,6 +1802,93 @@ setInterval(async () => {
   }
 }, 60_000)
 
+// Job diário: a cada 60s, credita o lucro de 24h do ciclo de investimento na carteira normal (balance)
+// Para cada purchase ativo, calcula o lucro/dia e adiciona ao balance do usuário.
+setInterval(async () => {
+  try {
+    const [purchases] = await pool.query<RowDataPacket[]>(
+      `SELECT
+        ucp.id,
+        ucp.user_id AS userId,
+        ucp.expected_profit AS expectedProfit,
+        ucp.cycle_days AS cycleDays,
+        ucp.status,
+        ucp.started_at AS startedAt,
+        ucp.ends_at AS endsAt,
+        ucp.last_credited_at AS lastCreditedAt,
+        COALESCE(ucp.total_credited, 0) AS totalCredited
+       FROM user_cycle_purchases ucp
+       WHERE ucp.status = 'active'`
+    )
+
+    const now = new Date()
+
+    for (const p of purchases) {
+      const endsAt = new Date(p.endsAt)
+      const lastCreditedAt = p.lastCreditedAt ? new Date(p.lastCreditedAt) : null
+      const startedAt = new Date(p.startedAt)
+      const totalCredited = Number(p.totalCredited ?? 0)
+      const expectedProfit = Number(p.expectedProfit)
+      const cycleDays = Number(p.cycleDays)
+
+      // Se o plano já venceu, marca como completed e não credita mais
+      if (now.getTime() >= endsAt.getTime()) {
+        await pool.query(
+          `UPDATE user_cycle_purchases SET status = 'completed' WHERE id = ?`,
+          [Number(p.id)]
+        )
+        continue
+      }
+
+      // Já creditou tudo que precisava?
+      if (totalCredited >= expectedProfit) {
+        await pool.query(
+          `UPDATE user_cycle_purchases SET status = 'completed' WHERE id = ?`,
+          [Number(p.id)]
+        )
+        continue
+      }
+
+      // Só credita se já passaram pelo menos 24h desde o último crédito (ou desde o início, se nunca creditado)
+      if (lastCreditedAt) {
+        const diffMs = now.getTime() - lastCreditedAt.getTime()
+        if (diffMs < 24 * 60 * 60 * 1000) continue
+      } else {
+        // Primeira vez: só credita se já passou pelo menos 24h desde o início do ciclo
+        const diffMs = now.getTime() - startedAt.getTime()
+        if (diffMs < 24 * 60 * 60 * 1000) continue
+      }
+
+      const dailyProfit = expectedProfit / cycleDays
+      if (dailyProfit <= 0) continue
+
+      const credited = Math.round(dailyProfit * 100) / 100
+      const newTotalCredited = Math.round((totalCredited + credited) * 100) / 100
+
+      // Não credita mais do que o esperado
+      if (newTotalCredited > expectedProfit) {
+        credited = Math.round((expectedProfit - totalCredited) * 100) / 100
+      }
+
+      if (credited <= 0) continue
+
+      // Credita SOMENTE na carteira normal (balance)
+      await pool.query(
+        `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE id = ?`,
+        [credited, Number(p.userId)]
+      )
+
+      // Marca o momento do crédito e atualiza total creditado
+      await pool.query(
+        `UPDATE user_cycle_purchases SET last_credited_at = NOW(), total_credited = ? WHERE id = ?`,
+        [Math.round((totalCredited + credited) * 100) / 100, Number(p.id)]
+      )
+    }
+  } catch (err) {
+    console.error('[cycle-daily-profit-job]', err)
+  }
+}, 60_000)
+
 // POST /api/presence/heartbeat — chamado pelo frontend a cada 30s
 app.post('/api/presence/heartbeat', (req, res) => {
   const userId = String(req.body?.userId ?? '').trim()
@@ -1960,6 +2035,23 @@ const migrateVipLevelsRewardColumn = async () => {
 
 const bootstrapDatabase = async () => {
   await ensureDatabaseExists()
+
+  // ── Coluna is_admin em users (uma vez só) ───────────────────────────────────
+  try {
+    await pool.query(`ALTER TABLE users ADD COLUMN is_admin TINYINT(1) NOT NULL DEFAULT 0`)
+    console.log('[bootstrap-database] is_admin column added to users')
+  } catch {
+    // coluna já existe
+  }
+
+  // ── Coluna last_credited_at em user_cycle_purchases (uma vez só) ─────────────
+  try {
+    await pool.query(`ALTER TABLE user_cycle_purchases ADD COLUMN last_credited_at DATETIME NULL COMMENT 'Última vez que o lucro de 24h foi creditado'`)
+    console.log('[bootstrap-database] last_credited_at column added to user_cycle_purchases')
+  } catch {
+    // coluna já existe
+  }
+
   await ensureTelegramConfigTable()
   await ensureUserTelegramConnectionsTable()
   await ensureTelegramConnectedColumn()
@@ -2007,12 +2099,14 @@ const bootstrapDatabase = async () => {
       qr_image                TEXT            NULL,
       provider_payload        LONGTEXT        NULL,
       paid_at                 DATETIME        NULL,
+      referral_code_used      VARCHAR(120)    NULL COMMENT ' referral_code do link que o depositante usou para se indicar (nível 1 via link)',
       created_at              DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at              DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
       KEY idx_sd_user   (user_id),
       KEY idx_sd_tx     (provider_transaction_id),
-      KEY idx_sd_status (status)
+      KEY idx_sd_status (status),
+      KEY idx_sd_refcode (referral_code_used)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `)
 
@@ -2770,7 +2864,9 @@ app.get('/api/user/invite-counts/:userId', requireAuth, async (req, res) => {
 
 // ─── Login ───────────────────────────────────────────────────────────────────
 app.get('/api/user/summary/:id', async (req, res) => {
-  const userId = Number(req.params.id)
+  const rawId = req.params.id
+  const userId = Number(rawId)
+  console.log('[user-summary] REQUEST start — rawId:', rawId, '-> userId:', userId)
 
   if (!userId || Number.isNaN(userId)) {
     res.status(400).json({ error: 'ID de usuário inválido.' })
@@ -2802,6 +2898,14 @@ app.get('/api/user/summary/:id', async (req, res) => {
       .query('ALTER TABLE users ADD COLUMN commission_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00')
       .catch(() => null)
 
+    // Auto-expirar VIPs vencidos antes de consultar
+    await pool.query(
+      `UPDATE user_vips
+       SET status = 'inactive'
+       WHERE user_id = ? AND status = 'active' AND expires_at IS NOT NULL AND expires_at <= NOW()`,
+      [userId]
+    )
+
     const [rows] = await pool.query<RowDataPacket[]>(
       `SELECT
          balance,
@@ -2820,6 +2924,61 @@ app.get('/api/user/summary/:id', async (req, res) => {
       return
     }
 
+    // Buscar VIP ativo do usuário
+    console.log('[user-summary] checking VIP for userId:', userId)
+    const [vipRows] = await pool.query<RowDataPacket[]>(
+      `SELECT
+         uv.vip_level_id AS vipLevelId,
+         vl.name AS vipName,
+         uv.status,
+         uv.expires_at AS expiresAt
+       FROM user_vips uv
+       JOIN vip_levels vl ON vl.id = uv.vip_level_id
+       WHERE uv.user_id = ? AND uv.status = 'active' AND (uv.expires_at IS NULL OR uv.expires_at > NOW())
+       LIMIT 1`,
+      [userId]
+    )
+    console.log('[user-summary] VIP rows found:', vipRows.length, vipRows[0] ?? null)
+
+    const currentVip = vipRows.length > 0
+      ? { vipLevelId: Number(vipRows[0].vipLevelId), name: String(vipRows[0].vipName) }
+      : null
+
+    // Buscar contagens de rede (t0=t0, t1=nível 1, t2=nível 2, t3=nível 3, t4=nível 4, t5=nível 5)
+    const teamCounts: Record<string, number> = { t0: 0, t1: 0, t2: 0, t3: 0, t4: 0, t5: 0 }
+    try {
+      // t1 — nível direto (1 salto)
+      const [t1Rows] = await pool.query<RowDataPacket[]>(
+        `SELECT COUNT(*) AS cnt FROM users WHERE referred_by_user_id = ?`,
+        [userId]
+      )
+      teamCounts.t1 = Number(t1Rows[0]?.cnt ?? 0)
+      teamCounts.t0 = teamCounts.t1 // t0 espelha t1 na nomenclatura do projeto
+
+      // t2, t3, t4, t5 — níveis indiretos
+      for (let level = 2; level <= 5; level++) {
+        const [levelRows] = await pool.query<RowDataPacket[]>(
+          `SELECT COUNT(*) AS cnt FROM (
+            WITH RECURSIVE referral_tree AS (
+              SELECT id, referred_by_user_id, 1 AS level
+              FROM users WHERE referred_by_user_id = ?
+              UNION ALL
+              SELECT u.id, u.referred_by_user_id, rt.level + 1
+              FROM users u
+              INNER JOIN referral_tree rt ON u.referred_by_user_id = rt.id
+              WHERE rt.level < ?
+            )
+            SELECT id FROM referral_tree WHERE level = ?
+          ) AS sub`,
+          [userId, level, level]
+        )
+        const key = `t${level}`
+        teamCounts[key] = Number(levelRows[0]?.cnt ?? 0)
+      }
+    } catch (err) {
+      console.error('[user-summary-team-counts]', err)
+    }
+
     const row = rows[0] as {
       balance: number | string
       shop_balance: number | string
@@ -2830,6 +2989,7 @@ app.get('/api/user/summary/:id', async (req, res) => {
       commissionBalance?: number | string
     }
 
+    console.log('[user-summary] final response currentVip:', JSON.stringify(currentVip))
     res.json({
       balance: Number(row.balance ?? 0),
       shopBalance: Number(row.shop_balance ?? 0),
@@ -2838,6 +2998,8 @@ app.get('/api/user/summary/:id', async (req, res) => {
       commissionBalance: Number(row.commissionBalance ?? 0),
       monthlySalaryContract: row.monthlySalaryContract == null ? null : String(row.monthlySalaryContract),
       badge: row.badge == null || String(row.badge).trim() === '' ? 'Estagiário' : String(row.badge),
+      currentVip,
+      teamCounts,
     })
   } catch (err) {
     console.error('[user-summary]', err)
@@ -2917,10 +3079,11 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 })
 
 app.post('/api/CASHIN/', async (req, res) => {
-  const { userId, amount, method } = req.body as {
+  const { userId, amount, method, referralCodeUsed } = req.body as {
     userId?: number
     amount?: number
     method?: string
+    referralCodeUsed?: string
   }
 
   const parsedUserId = Number(userId)
@@ -3058,9 +3221,11 @@ app.post('/api/CASHIN/', async (req, res) => {
         status,
         pix_code,
         qr_image,
-        provider_payload
+        provider_payload,
+        paid_at,
+        referral_code_used
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         parsedUserId,
@@ -3071,6 +3236,8 @@ app.post('/api/CASHIN/', async (req, res) => {
         qrCode || null,
         qrImage || null,
         JSON.stringify(lumoData),
+        null,
+        referralCodeUsed || null,
       ]
     ) as any
 
@@ -3167,43 +3334,35 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
             [Number(existing.amount ?? amountBRL), Number(existing.amount ?? amountBRL), Number(existing.amount ?? amountBRL), existing.user_id]
           )
 
-          const [depositorRows] = await pool.query<RowDataPacket[]>(
-            `
-            SELECT referred_by_user_id AS referredByUserId
-            FROM users
-            WHERE id = ?
-            LIMIT 1
-            `,
-            [Number(existing.user_id)]
+          // Gira a roleta: só se o depositante depositou via link de convite (referral_code_used)
+          // Se o depositante não usou link, referral_code_used é NULL → sem giro
+          const [refCodeRows] = await pool.query<RowDataPacket[]>(
+            `SELECT referral_code_used FROM cashin_payments WHERE id = ? LIMIT 1`,
+            [Number(existing.id)]
           )
+          const referralCodeUsed = String(refCodeRows[0]?.referral_code_used ?? '').trim()
 
-          const referredByUserId = Number(depositorRows[0]?.referredByUserId ?? 0)
-          if (referredByUserId > 0) {
-            // Giro na roleta só é concedido no PRIMEIRO depósito do indicado (nível 1)
-            const [prevDepositsRows] = await pool.query<RowDataPacket[]>(
-              `
-              SELECT COUNT(*) AS total
-              FROM cashin_payments
-              WHERE user_id = ?
-                AND status IN ('paid', 'payment.paid')
-                AND id != ?
-              `,
-              [Number(existing.user_id), Number(existing.id)]
+          if (referralCodeUsed) {
+            // Busca o dono do referral_code (quem indicou via link)
+            const [referrerRows] = await pool.query<RowDataPacket[]>(
+              `SELECT id AS referrerId FROM users WHERE referral_code = ? LIMIT 1`,
+              [referralCodeUsed]
             )
-            const prevDeposits = Number((prevDepositsRows as RowDataPacket[])[0]?.total ?? 0)
-            if (prevDeposits === 0) {
-              await ensureUserRouletteSpinsTable()
-              await pool.query(
-                `
-                INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
-                VALUES (?, 1, 1, 0)
-                ON DUPLICATE KEY UPDATE
-                  available_spins = COALESCE(available_spins, 0) + 1,
-                  total_earned = COALESCE(total_earned, 0) + 1,
-                  updated_at = NOW()
-                `,
-                [referredByUserId]
+            const referrerId = Number(referrerRows[0]?.referrerId ?? 0)
+            if (referrerId > 0) {
+              // Verifica se é o primeiro depósito pago do depositante
+              const [prevDepositsRows] = await pool.query<RowDataPacket[]>(
+                `SELECT COUNT(*) AS total FROM cashin_payments WHERE user_id = ? AND status IN ('paid', 'payment.paid') AND id != ?`,
+                [Number(existing.user_id), Number(existing.id)]
               )
+              const prevDeposits = Number((prevDepositsRows as RowDataPacket[])[0]?.total ?? 0)
+              if (prevDeposits === 0) {
+                await ensureUserRouletteSpinsTable()
+                await pool.query(
+                  `INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used) VALUES (?, 1, 1, 0) ON DUPLICATE KEY UPDATE available_spins = COALESCE(available_spins, 0) + 1, total_earned = COALESCE(total_earned, 0) + 1, updated_at = NOW()`,
+                  [referrerId]
+                )
+              }
             }
           }
 
@@ -3236,6 +3395,13 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
     }
 
     if (userId && !Number.isNaN(userId)) {
+      // Busca referral_code do usuário (via link de convite) para salvar no depósito
+      const [userRows] = await pool.query<RowDataPacket[]>(
+        `SELECT referral_code FROM users WHERE id = ? LIMIT 1`,
+        [userId]
+      )
+      const userReferralCode = String(userRows[0]?.referral_code ?? '').trim()
+
       await pool.query(
         `
         INSERT INTO cashin_payments
@@ -3246,9 +3412,10 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           method,
           status,
           provider_payload,
-          paid_at
+          paid_at,
+          referral_code_used
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           userId,
@@ -3258,6 +3425,7 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           normalizedStatus,
           JSON.stringify(data),
           isPaid ? new Date() : null,
+          userReferralCode || null,
         ]
       )
 
@@ -3274,43 +3442,31 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           [amountBRL, amountBRL, amountBRL, userId]
         )
 
-        const [depositorRows] = await pool.query<RowDataPacket[]>(
-          `
-          SELECT referred_by_user_id AS referredByUserId
-          FROM users
-          WHERE id = ?
-          LIMIT 1
-          `,
+        // Gira a roleta: só se o depositante depositou via link de convite (referral_code_used)
+        const [newDepositRows] = await pool.query<RowDataPacket[]>(
+          `SELECT referral_code_used FROM cashin_payments WHERE user_id = ? AND status = 'paid' ORDER BY id DESC LIMIT 1`,
           [userId]
         )
-
-        const referredByUserId = Number(depositorRows[0]?.referredByUserId ?? 0)
-        if (referredByUserId > 0) {
-          // Giro na roleta só é concedido no PRIMEIRO depósito do indicado (nível 1)
-          const [prevDepositsRows2] = await pool.query<RowDataPacket[]>(
-            `
-            SELECT COUNT(*) AS total
-            FROM cashin_payments
-            WHERE user_id = ?
-              AND status IN ('paid', 'payment.paid')
-            `,
-            [userId]
+        const referralCodeUsed = String(newDepositRows[0]?.referral_code_used ?? '').trim()
+        if (referralCodeUsed) {
+          const [referrerRows] = await pool.query<RowDataPacket[]>(
+            `SELECT id AS referrerId FROM users WHERE referral_code = ? LIMIT 1`,
+            [referralCodeUsed]
           )
-          const prevDeposits2 = Number((prevDepositsRows2 as RowDataPacket[])[0]?.total ?? 0)
-          // prevDeposits2 === 1 porque o INSERT acima já inseriu este depósito como paid
-          if (prevDeposits2 <= 1) {
-            await ensureUserRouletteSpinsTable()
-            await pool.query(
-              `
-              INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
-              VALUES (?, 1, 1, 0)
-              ON DUPLICATE KEY UPDATE
-                available_spins = COALESCE(available_spins, 0) + 1,
-                total_earned = COALESCE(total_earned, 0) + 1,
-                updated_at = NOW()
-              `,
-              [referredByUserId]
+          const referrerId = Number(referrerRows[0]?.referrerId ?? 0)
+          if (referrerId > 0) {
+            const [prevDepositsRows2] = await pool.query<RowDataPacket[]>(
+              `SELECT COUNT(*) AS total FROM cashin_payments WHERE user_id = ? AND status IN ('paid', 'payment.paid')`,
+              [userId]
             )
+            const prevDeposits2 = Number((prevDepositsRows2 as RowDataPacket[])[0]?.total ?? 0)
+            if (prevDeposits2 <= 1) {
+              await ensureUserRouletteSpinsTable()
+              await pool.query(
+                `INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used) VALUES (?, 1, 1, 0) ON DUPLICATE KEY UPDATE available_spins = COALESCE(available_spins, 0) + 1, total_earned = COALESCE(total_earned, 0) + 1, updated_at = NOW()`,
+                [referrerId]
+              )
+            }
           }
         }
 
@@ -5192,7 +5348,7 @@ app.get('/api/vip/user/:userId', async (req, res) => {
     )
 
     const [balanceRows] = await pool.query<RowDataPacket[]>(
-      'SELECT balance FROM users WHERE id = ? LIMIT 1',
+      'SELECT balance, commission_balance, recharge_balance FROM users WHERE id = ? LIMIT 1',
       [userId]
     )
 
@@ -5202,6 +5358,8 @@ app.get('/api/vip/user/:userId', async (req, res) => {
     }
 
     const userBalance = Number(balanceRows[0].balance ?? 0)
+    const userCommissionBalance = Number(balanceRows[0].commission_balance ?? 0)
+    const userRechargeBalance = Number(balanceRows[0].recharge_balance ?? 0)
 
     const [rows] = await pool.query<RowDataPacket[]>(
       `
@@ -5229,7 +5387,7 @@ app.get('/api/vip/user/:userId', async (req, res) => {
     )
 
     if (rows.length === 0) {
-      res.json({ ok: true, hasVip: false, vip: null, balance: userBalance })
+      res.json({ ok: true, hasVip: false, vip: null, balance: userBalance, commission_balance: userCommissionBalance, recharge_balance: userRechargeBalance })
       return
     }
 
@@ -5238,6 +5396,8 @@ app.get('/api/vip/user/:userId', async (req, res) => {
       ok: true,
       hasVip: true,
       balance: userBalance,
+      commission_balance: userCommissionBalance,
+      recharge_balance: userRechargeBalance,
       vip: {
         id: Number(vip.id),
         userId: Number(vip.userId),
@@ -5259,10 +5419,12 @@ app.get('/api/vip/user/:userId', async (req, res) => {
 })
 
 app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res) => {
-  const { userId, vipLevelId } = req.body as { userId?: number; vipLevelId?: number }
+  const { userId, vipLevelId, wallet } = req.body as { userId?: number; vipLevelId?: number; wallet?: string }
 
   const parsedUserId = Number(userId)
   const parsedVipLevelId = Number(vipLevelId)
+  const allowedWallets = ['balance', 'commission_balance', 'recharge_balance']
+  const walletField = allowedWallets.includes(wallet ?? '') ? wallet! : 'balance'
 
   if (!parsedUserId || Number.isNaN(parsedUserId)) {
     res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
@@ -5284,7 +5446,7 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
     await settleExpiredCyclesForUser(parsedUserId)
 
     const [users] = await pool.query<RowDataPacket[]>(
-      'SELECT id, balance FROM users WHERE id = ? LIMIT 1',
+      'SELECT id, balance, commission_balance, recharge_balance FROM users WHERE id = ? LIMIT 1',
       [parsedUserId]
     )
 
@@ -5309,7 +5471,7 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
 
     const levelPrice = Number(levels[0].price ?? 0)
     const levelDurationDays = Math.max(1, Math.round(Number(levels[0].durationDays ?? 365)))
-    const currentBalance = Number(users[0].balance ?? 0)
+    const currentWalletBalance = Number(users[0][walletField] ?? 0)
 
     // Bloqueia ativação de VIP gratuito (T0 - Estágio): só é concedido automaticamente no cadastro.
     if (levelPrice <= 0) {
@@ -5420,12 +5582,12 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
       return
     }
 
-    if (currentBalance < levelPrice) {
+    if (currentWalletBalance < levelPrice) {
       res.status(400).json({
         ok: false,
-        error: 'Saldo insuficiente para ativar este VIP.',
+        error: `Saldo insuficiente na carteira selecionada para ativar este VIP. Necessário: R$ ${levelPrice.toFixed(2).replace('.', ',')}, disponível: R$ ${currentWalletBalance.toFixed(2).replace('.', ',')}`,
         required: levelPrice,
-        available: currentBalance,
+        available: currentWalletBalance,
       })
       return
     }
@@ -5443,20 +5605,14 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
         [parsedUserId]
       )
 
-      await conn.query(
-        `
-        UPDATE users
-        SET
-          balance = COALESCE(balance, 0) - ?,
-          commission_balance = GREATEST(COALESCE(commission_balance, 0) - ?, 0),
-          recharge_balance = GREATEST(
-            COALESCE(recharge_balance, 0) - GREATEST(? - COALESCE(commission_balance, 0), 0),
-            0
-          )
-        WHERE id = ?
-        `,
-        [levelPrice, levelPrice, levelPrice, parsedUserId]
-      )
+      // Deduct only from selected wallet
+      if (walletField === 'balance') {
+        await conn.query(`UPDATE users SET balance = COALESCE(balance, 0) - ? WHERE id = ?`, [levelPrice, parsedUserId])
+      } else if (walletField === 'commission_balance') {
+        await conn.query(`UPDATE users SET commission_balance = COALESCE(commission_balance, 0) - ? WHERE id = ?`, [levelPrice, parsedUserId])
+      } else if (walletField === 'recharge_balance') {
+        await conn.query(`UPDATE users SET recharge_balance = COALESCE(recharge_balance, 0) - ? WHERE id = ?`, [levelPrice, parsedUserId])
+      }
 
       await conn.query(
         `
@@ -6510,6 +6666,7 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
         status ENUM('active','completed','cancelled') NOT NULL DEFAULT 'active',
         started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         ends_at DATETIME NULL,
+        last_credited_at DATETIME NULL COMMENT 'Última vez que o lucro de 24h foi creditado',
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
@@ -6519,6 +6676,15 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
       )
       `
     )
+
+    // Adiciona coluna total_credited se não existir (Migração)
+    try {
+      await pool.query(
+        `ALTER TABLE user_cycle_purchases ADD COLUMN total_credited DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT 'Total já creditado ao usuário'`
+      )
+    } catch {
+      // pode já existir
+    }
 
     const [cycleRows] = await pool.query<RowDataPacket[]>(
       `
@@ -6794,6 +6960,7 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
         status ENUM('active','completed','cancelled') NOT NULL DEFAULT 'active',
         started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         ends_at DATETIME NULL,
+        last_credited_at DATETIME NULL COMMENT 'Última vez que o lucro de 24h foi creditado',
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
@@ -6803,6 +6970,14 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
       )
       `
     )
+
+    try {
+      await conn.query(
+        `ALTER TABLE user_cycle_purchases ADD COLUMN total_credited DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT 'Total já creditado ao usuário'`
+      )
+    } catch {
+      // pode já existir
+    }
 
     await conn.query(
       `
@@ -6840,17 +7015,18 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
         cycle_days,
         status,
         started_at,
-        ends_at
+        ends_at,
+        total_credited
       )
-      VALUES (?, ?, ?, ?, ?, 'active', NOW(), DATE_ADD(NOW(), INTERVAL ? DAY))
+      VALUES (?, ?, ?, ?, ?, 'active', NOW(), DATE_ADD(NOW(), INTERVAL ? DAY), 0)
       `,
       [
         parsedUserId,
         Number(product.id),
         amount,
         profit,
-        Number(product.cycleDays ?? 0),
-        Number(product.cycleDays ?? 0),
+        cycleDaysNum,
+        cycleDaysNum,
       ]
     ) as any
 
@@ -8314,11 +8490,10 @@ app.post('/api/checkin/claim', requireAuth, async (req: AuthenticatedRequest, re
       `
       UPDATE users
       SET
-        balance = COALESCE(balance, 0) + ?,
-        commission_balance = COALESCE(commission_balance, 0) + ?
+        balance = COALESCE(balance, 0) + ?
       WHERE id = ?
       `,
-      [rewardAmount, rewardAmount, parsedUserId]
+      [rewardAmount, parsedUserId]
     )
 
     const [updatedRows] = await conn.query<RowDataPacket[]>(
@@ -8453,18 +8628,40 @@ app.get('/api/cycles/orders/:userId', async (req, res) => {
         uiStatus = 'completed'
       }
 
+      const startedAt = row.startedAt ? new Date(row.startedAt) : null
+      const amountPaid = Number(row.amountPaid ?? 0)
+      const expectedProfit = Number(row.expectedProfit ?? 0)
+      const cycleDays = Number(row.cycleDays ?? 0)
+
+      // Lucro por dia (lucro total / dias do ciclo)
+      const dailyProfit = cycleDays > 0 ? expectedProfit / cycleDays : 0
+
+      // Dias decorridos desde o início do investimento (arredondados para baixo)
+      let daysElapsed = 0
+      if (startedAt && now.getTime() >= startedAt.getTime()) {
+        daysElapsed = Math.floor((now.getTime() - startedAt.getTime()) / (24 * 60 * 60 * 1000))
+      }
+      if (uiStatus === 'completed' && cycleDays > 0) {
+        daysElapsed = cycleDays
+      }
+
+      // Total acumulado: dias decorridos × lucro diário
+      const totalEarnedSoFar = Math.min(daysElapsed * dailyProfit, expectedProfit)
+
       return {
         id: Number(row.id),
         userId: Number(row.userId),
         cycleProductId: Number(row.cycleProductId),
         productName: String(row.productName ?? 'Plano de ciclo'),
-        amountPaid: Number(row.amountPaid ?? 0),
-        expectedProfit: Number(row.expectedProfit ?? 0),
-        cycleDays: Number(row.cycleDays ?? 0),
+        amountPaid,
+        expectedProfit,
+        cycleDays,
         status: dbStatus,
         uiStatus,
         startedAt: row.startedAt,
         endsAt: row.endsAt,
+        dailyProfit: Math.round(dailyProfit * 100) / 100,
+        totalEarnedSoFar: Math.round(totalEarnedSoFar * 100) / 100,
       }
     })
 
@@ -14578,14 +14775,29 @@ app.post('/api/admin/migrate-balance-columns', requireMaxAdmin, async (_req: Aut
         qr_image LONGTEXT NULL,
         provider_payload JSON NULL,
         paid_at DATETIME NULL,
+        referral_code_used VARCHAR(120) NULL COMMENT 'referral_code do link que o depositante usou (nível 1 via link)',
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
         KEY idx_cashin_user_id (user_id),
-        UNIQUE KEY uq_cashin_provider_transaction_id (provider_transaction_id)
+        UNIQUE KEY uq_cashin_provider_transaction_id (provider_transaction_id),
+        KEY idx_cashin_refcode (referral_code_used)
       )
       `
     )
+
+    // Garante coluna referral_code_used em cashin_payments (nível 1 via link)
+    try {
+      const [cols] = await pool.query<RowDataPacket[]>(
+        "SHOW COLUMNS FROM cashin_payments LIKE 'referral_code_used'"
+      )
+      if (cols.length === 0) {
+        await pool.query(
+          'ALTER TABLE cashin_payments ADD COLUMN referral_code_used VARCHAR(120) NULL COMMENT "referral_code do link que o depositante usou (nível 1 via link)"'
+        )
+        console.log('[bootstrap] column referral_code_used added to cashin_payments')
+      }
+    } catch (_) { /* colunas podem já existir */ }
 
     await pool.query(
       `
@@ -17672,7 +17884,23 @@ io.on('connection', (socket) => {
 
 httpServer.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`)
-  console.log('📋 HTTP request logging: enabled')
-  console.log('🧯 Global error logging: enabled')
-  console.log('🔌 WebSocket enabled')
+
+  // ── Debug endpoint: testa auth via token ──────────────────────────────────
+  app.get('/api/debug-auth', async (req, res) => {
+    const authHeader = String(req.headers.authorization ?? '')
+    const token = authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7).trim()
+      : ''
+    if (!token) {
+      res.json({ ok: false, step: 'no_token' })
+      return
+    }
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET) as JwtPayload
+      const userId = Number(decoded?.id)
+      res.json({ ok: true, step: 'jwt_decoded', userId, decoded })
+    } catch (e) {
+      res.json({ ok: false, step: 'jwt_error', error: String(e) })
+    }
+  })
 })
