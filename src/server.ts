@@ -3416,7 +3416,7 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           paid_at,
           referral_code_used
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           userId,
