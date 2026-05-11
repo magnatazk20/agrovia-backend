@@ -3162,7 +3162,7 @@ app.post('/api/CASHIN/', async (req, res) => {
       customerDocumentType: 'cpf',
       customerPhone: normalizedPhone || '11999998888',
       description: `Depósito CASHIN - usuário #${user.id}`,
-      callbackUrl: 'https://api.pgl-m.com/api/CASHIN/webhook',
+      callbackUrl: 'https://agrovia.org/api/CASHIN/webhook',
       metadata: {
         userId: user.id,
         method: method ?? 'pix',
@@ -3601,7 +3601,7 @@ app.post('/api/shop/deposit', requireAuth, async (req: AuthenticatedRequest, res
       customerDocumentType: 'cpf',
       customerPhone:        (user.phone || '').replace(/\D/g, '') || '11999998888',
       description:          `Depósito loja PGLM - usuário #${user.id}`,
-      callbackUrl:          `https://api.pgl-m.com/api/shop/deposit/webhook`,
+      callbackUrl:          `https://agrovia.org/api/shop/deposit/webhook`,
       metadata: { userId: user.id, source: 'loja' },
     }
 
