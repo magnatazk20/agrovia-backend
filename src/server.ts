@@ -2716,7 +2716,8 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     // Hash da senha
     const hash = await bcrypt.hash(password, 10)
 
-    const userReferralCode = `U${Date.now().toString(36).toUpperCase()}${Math.floor(Math.random() * 900 + 100)}`
+    const refChars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    const userReferralCode = Array.from({ length: 16 }, () => refChars[Math.floor(Math.random() * refChars.length)]).join('')
     let referredByUserId: number | null = null
 
     if (referralCode) {
