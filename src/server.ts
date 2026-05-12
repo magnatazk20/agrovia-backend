@@ -2743,59 +2743,6 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
 
     const userId = result.insertId
 
-    // ── Concede automaticamente o VIP padrão (configurado no admin) ao novo usuário ──
-    // O VIP padrão é definido pela coluna `is_default = 1` em vip_levels.
-    // Fallback: se nenhum VIP estiver marcado como padrão, tenta o id=6 (T0 - Estágio).
-    try {
-      const [defaultVipRows] = await pool.query<RowDataPacket[]>(
-        `SELECT id, duration_days AS durationDays
-         FROM vip_levels
-         WHERE is_default = 1 AND is_active = 1
-         ORDER BY id ASC
-         LIMIT 1`
-      )
-
-      let defaultVipId: number | null = null
-      let defaultVipDuration = 0 // 0 = sem expiração
-
-      if (defaultVipRows.length > 0) {
-        defaultVipId = Number(defaultVipRows[0].id)
-        defaultVipDuration = Number(defaultVipRows[0].durationDays ?? 0)
-      } else {
-        // Fallback: procurar id=6 (compatibilidade)
-        const [fallbackRows] = await pool.query<RowDataPacket[]>(
-          `SELECT id, duration_days AS durationDays FROM vip_levels WHERE id = 6 AND is_active = 1 LIMIT 1`
-        )
-        if (fallbackRows.length > 0) {
-          defaultVipId = Number(fallbackRows[0].id)
-          defaultVipDuration = Number(fallbackRows[0].durationDays ?? 0)
-        }
-      }
-
-      if (defaultVipId !== null) {
-        // Se o VIP padrão for gratuito (preço = 0), usar expiração NULL (vitalício),
-        // caso contrário usar a duration_days do plano.
-        if (defaultVipDuration > 0) {
-          await pool.query(
-            `INSERT INTO user_vips
-             (user_id, vip_level_id, status, started_at, expires_at)
-             VALUES (?, ?, 'active', NOW(), DATE_ADD(NOW(), INTERVAL ? DAY))`,
-            [userId, defaultVipId, defaultVipDuration]
-          )
-        } else {
-          await pool.query(
-            `INSERT INTO user_vips
-             (user_id, vip_level_id, status, started_at, expires_at)
-             VALUES (?, ?, 'active', NOW(), NULL)`,
-            [userId, defaultVipId]
-          )
-        }
-      } else {
-        console.warn('[register] Nenhum VIP padrão configurado e id=6 não encontrado. Pulando atribuição automática.')
-      }
-    } catch (vipErr) {
-      console.error('[register-default-vip]', vipErr)
-    }
 
     // Giro da roleta NÃO é concedido no cadastro.
     // O giro só é concedido quando o indicado (nível 1) fizer o primeiro depósito.
@@ -3384,7 +3331,12 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
             )
           }
 
-          // Comissão por depósito removida – comissão agora é por compra de VIP
+          // Comissão por depósito via link (níveis 1..3)
+          await applyReferralCommissionsForDeposit(
+            Number(existing.id),
+            Number(existing.user_id),
+            Number(existing.amount ?? amountBRL)
+          )
 
           // Emite saldo atualizado via WebSocket
           emitBalanceUpdate(Number(existing.user_id))
@@ -3396,14 +3348,7 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
     }
 
     if (userId && !Number.isNaN(userId)) {
-      // Busca referral_code do usuário (via link de convite) para salvar no depósito
-      const [userRows] = await pool.query<RowDataPacket[]>(
-        `SELECT referral_code FROM users WHERE id = ? LIMIT 1`,
-        [userId]
-      )
-      const userReferralCode = String(userRows[0]?.referral_code ?? '').trim()
-
-      await pool.query(
+      const [insertResult] = await pool.query(
         `
         INSERT INTO cashin_payments
         (
@@ -3426,9 +3371,11 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           normalizedStatus,
           JSON.stringify(data),
           isPaid ? new Date() : null,
-          userReferralCode || null,
+          null,
         ]
       )
+
+      const createdPaymentId = Number((insertResult as any)?.insertId ?? 0)
 
       if (isPaid && amountBRL > 0) {
         await pool.query(
@@ -3487,18 +3434,13 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           )
         }
 
-        const [createdRows] = await pool.query<RowDataPacket[]>(
-          `
-          SELECT id
-          FROM cashin_payments
-          WHERE provider_transaction_id = ?
-          ORDER BY id DESC
-          LIMIT 1
-          `,
-          [providerTransactionId ? String(providerTransactionId) : '']
-        )
-
-        // Comissão por depósito removida – comissão agora é por compra de VIP
+        if (createdPaymentId > 0) {
+          await applyReferralCommissionsForDeposit(
+            createdPaymentId,
+            userId,
+            amountBRL
+          )
+        }
 
         // Emite saldo atualizado via WebSocket
         emitBalanceUpdate(userId)
@@ -5673,11 +5615,6 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
       }
 
       await conn.commit()
-
-      // Distribui comissões para os uplines (fora da transação principal)
-      applyReferralCommissionsForVipPurchase(parsedUserId, levelPrice, purchaseId).catch((err) => {
-        console.error('[vip-activate] Erro ao distribuir comissões:', err)
-      })
 
       // Emite saldo atualizado via WebSocket para o comprador
       emitBalanceUpdate(parsedUserId)
