@@ -26,8 +26,8 @@ const io = new SocketIOServer(httpServer, {
 const PORT = process.env.PORT     ?? 3333
 const JWT_SECRET   = process.env.JWT_SECRET   ?? 'fallback_secret'
 const JWT_EXPIRES  = process.env.JWT_EXPIRES_IN ?? '7d'
-const LUMO_API_KEY = 'pk_69aa7a3d1a07dffe750eb533c92fabbe87974479ed791fb7ead328a56e67143d'
-const LUMO_WEBHOOK_SECRET = 'sk_8910b90244b35ab56342bc3c019e569bb59abb9a90a7f69ad1dd59ce59ebd1065dc6240536d0a7b2e69496f8bac1dcdb739d22767183e2421b590f1fbfb77e39'
+const LUMO_API_KEY = 'pk_eb760ce48d7f65043c90ac381d6c1c694a3349ea476334fa449ee9cc6d8688d5'
+const LUMO_WEBHOOK_SECRET = 'sk_06dfa61ba74f15e967ee9e550e62665268eb6a80099e88ea3df30c38966123de4c9cb287f0b1f5820a815faf9b87c927952f145df7a663844e217424c467b870'
 const LUMOPAY_TRANSFER_URL = 'https://api.lumopayment.com/api/payments/transfers/pix'
 const SAO_PAULO_TZ = 'America/Sao_Paulo'
 
