@@ -1,7 +1,7 @@
-# TODO - Garantir comissão sempre em commission_balance
+# TODO - Retroativo comissão + roleta (depósitos afetados)
 
-- [x] Revisar fluxo de comissão por compra de VIP (`applyReferralCommissionsForVipPurchase`)
-- [ ] Mapear outros fluxos de comissão no backend que possam creditar no `balance`
-- [ ] Ajustar trechos encontrados para creditar apenas em `commission_balance`
-- [ ] Validar rapidamente os fluxos/consultas impactados
-- [ ] Commit e push para `main`
+- [x] Mapear no `server.ts` os fluxos atuais de CASHIN/webhook, comissão e roleta.
+- [ ] Implementar rotina/endpoint admin idempotente para reprocessar depósitos `paid` já existentes.
+- [ ] Garantir proteção contra duplicidade de crédito (comissão e roleta).
+- [ ] Executar teste de caminho crítico com curl.
+- [ ] Commit e push das alterações no backend.

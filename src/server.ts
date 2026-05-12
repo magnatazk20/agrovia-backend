@@ -10841,6 +10841,26 @@ const ensureMonthlySalaryPlansTable = async () => {
   }
 }
 
+const ensureCashinRetroactiveFixesTable = async () => {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS cashin_retroactive_fixes (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      cashin_payment_id BIGINT UNSIGNED NOT NULL,
+      fix_type VARCHAR(60) NOT NULL,
+      status ENUM('success','failed') NOT NULL DEFAULT 'success',
+      metadata JSON NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_cashin_retro_fix_payment_type (cashin_payment_id, fix_type),
+      KEY idx_cashin_retro_fix_type (fix_type),
+      KEY idx_cashin_retro_fix_status (status),
+      KEY idx_cashin_retro_fix_created_at (created_at)
+    )
+    `
+  )
+}
+
 const applyReferralCommissionsForDeposit = async (cashinPaymentId: number, depositorUserId: number, depositAmount: number) => {
   const parsedPaymentId = Number(cashinPaymentId)
   const parsedDepositorUserId = Number(depositorUserId)
