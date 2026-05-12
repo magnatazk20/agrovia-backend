@@ -1498,6 +1498,76 @@ const logSecurityEvent = async (opts: {
   }
 }
 
+const grantReferralLevel1RouletteSpinForFirstPaidDeposit = async (
+  cashinPaymentId: number,
+  depositorUserId: number
+) => {
+  const parsedPaymentId = Number(cashinPaymentId)
+  const parsedDepositorUserId = Number(depositorUserId)
+
+  if (!parsedPaymentId || Number.isNaN(parsedPaymentId) || !parsedDepositorUserId || Number.isNaN(parsedDepositorUserId)) {
+    return
+  }
+
+  const [paymentRows] = await pool.query<RowDataPacket[]>(
+    `
+    SELECT
+      id,
+      user_id AS userId,
+      referral_code_used AS referralCodeUsed,
+      status
+    FROM cashin_payments
+    WHERE id = ?
+    LIMIT 1
+    `,
+    [parsedPaymentId]
+  )
+
+  if (paymentRows.length === 0) return
+
+  const paymentRow = paymentRows[0]
+  const paymentStatus = String(paymentRow.status ?? '').trim().toLowerCase()
+  if (!(paymentStatus === 'paid' || paymentStatus === 'payment.paid')) return
+
+  const referralCodeUsed = String(paymentRow.referralCodeUsed ?? '').trim()
+  if (!referralCodeUsed) return
+
+  const [referrerRows] = await pool.query<RowDataPacket[]>(
+    `SELECT id AS referrerId FROM users WHERE referral_code = ? LIMIT 1`,
+    [referralCodeUsed]
+  )
+
+  const referrerId = Number(referrerRows[0]?.referrerId ?? 0)
+  if (!referrerId || Number.isNaN(referrerId) || referrerId <= 0) return
+
+  if (referrerId === parsedDepositorUserId) return
+
+  const [paidCountRows] = await pool.query<RowDataPacket[]>(
+    `
+    SELECT COUNT(*) AS total
+    FROM cashin_payments
+    WHERE user_id = ?
+      AND LOWER(status) IN ('paid', 'payment.paid')
+    `,
+    [parsedDepositorUserId]
+  )
+  const paidCount = Number((paidCountRows as RowDataPacket[])[0]?.total ?? 0)
+  if (paidCount !== 1) return
+
+  await ensureUserRouletteSpinsTable()
+  await pool.query(
+    `
+    INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
+    VALUES (?, 1, 1, 0)
+    ON DUPLICATE KEY UPDATE
+      available_spins = COALESCE(available_spins, 0) + 1,
+      total_earned = COALESCE(total_earned, 0) + 1,
+      updated_at = NOW()
+    `,
+    [referrerId]
+  )
+}
+
 const settleExpiredCyclesForUser = async (userId: number) => {
   if (!userId || Number.isNaN(userId)) return
 
@@ -3282,37 +3352,10 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
             [Number(existing.amount ?? amountBRL), Number(existing.amount ?? amountBRL), Number(existing.amount ?? amountBRL), existing.user_id]
           )
 
-          // Gira a roleta: só se o depositante depositou via link de convite (referral_code_used)
-          // Se o depositante não usou link, referral_code_used é NULL → sem giro
-          const [refCodeRows] = await pool.query<RowDataPacket[]>(
-            `SELECT referral_code_used FROM cashin_payments WHERE id = ? LIMIT 1`,
-            [Number(existing.id)]
+          await grantReferralLevel1RouletteSpinForFirstPaidDeposit(
+            Number(existing.id),
+            Number(existing.user_id)
           )
-          const referralCodeUsed = String(refCodeRows[0]?.referral_code_used ?? '').trim()
-
-          if (referralCodeUsed) {
-            // Busca o dono do referral_code (quem indicou via link)
-            const [referrerRows] = await pool.query<RowDataPacket[]>(
-              `SELECT id AS referrerId FROM users WHERE referral_code = ? LIMIT 1`,
-              [referralCodeUsed]
-            )
-            const referrerId = Number(referrerRows[0]?.referrerId ?? 0)
-            if (referrerId > 0) {
-              // Verifica se é o primeiro depósito pago do depositante
-              const [prevDepositsRows] = await pool.query<RowDataPacket[]>(
-                `SELECT COUNT(*) AS total FROM cashin_payments WHERE user_id = ? AND status IN ('paid', 'payment.paid') AND id != ?`,
-                [Number(existing.user_id), Number(existing.id)]
-              )
-              const prevDeposits = Number((prevDepositsRows as RowDataPacket[])[0]?.total ?? 0)
-              if (prevDeposits === 0) {
-                await ensureUserRouletteSpinsTable()
-                await pool.query(
-                  `INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used) VALUES (?, 1, 1, 0) ON DUPLICATE KEY UPDATE available_spins = COALESCE(available_spins, 0) + 1, total_earned = COALESCE(total_earned, 0) + 1, updated_at = NOW()`,
-                  [referrerId]
-                )
-              }
-            }
-          }
 
           // Concede 1 giro na Caixa Box ao próprio depositante se depositar R$50 ou mais
           const depositAmount = Number(existing.amount ?? amountBRL)
@@ -3390,33 +3433,10 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           [amountBRL, amountBRL, amountBRL, userId]
         )
 
-        // Gira a roleta: só se o depositante depositou via link de convite (referral_code_used)
-        const [newDepositRows] = await pool.query<RowDataPacket[]>(
-          `SELECT referral_code_used FROM cashin_payments WHERE user_id = ? AND status = 'paid' ORDER BY id DESC LIMIT 1`,
-          [userId]
+        await grantReferralLevel1RouletteSpinForFirstPaidDeposit(
+          createdPaymentId,
+          userId
         )
-        const referralCodeUsed = String(newDepositRows[0]?.referral_code_used ?? '').trim()
-        if (referralCodeUsed) {
-          const [referrerRows] = await pool.query<RowDataPacket[]>(
-            `SELECT id AS referrerId FROM users WHERE referral_code = ? LIMIT 1`,
-            [referralCodeUsed]
-          )
-          const referrerId = Number(referrerRows[0]?.referrerId ?? 0)
-          if (referrerId > 0) {
-            const [prevDepositsRows2] = await pool.query<RowDataPacket[]>(
-              `SELECT COUNT(*) AS total FROM cashin_payments WHERE user_id = ? AND status IN ('paid', 'payment.paid')`,
-              [userId]
-            )
-            const prevDeposits2 = Number((prevDepositsRows2 as RowDataPacket[])[0]?.total ?? 0)
-            if (prevDeposits2 <= 1) {
-              await ensureUserRouletteSpinsTable()
-              await pool.query(
-                `INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used) VALUES (?, 1, 1, 0) ON DUPLICATE KEY UPDATE available_spins = COALESCE(available_spins, 0) + 1, total_earned = COALESCE(total_earned, 0) + 1, updated_at = NOW()`,
-                [referrerId]
-              )
-            }
-          }
-        }
 
         // Concede 1 giro na Caixa Box ao próprio depositante se depositar R$50 ou mais
         if (amountBRL >= 50) {
