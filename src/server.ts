@@ -15853,6 +15853,7 @@ app.get('/api/admin/users/:id/details', requireMaxAdmin, async (req, res) => {
         COALESCE(is_banned, 0) AS is_banned,
         created_at,
         COALESCE(balance, 0) AS balance,
+        COALESCE(commission_balance, 0) AS commissionBalance,
         COALESCE(shop_balance, 0) AS shopBalance,
         COALESCE(telegram_conectado, 0) AS telegramConectado,
         monthly_salary_contract AS activeContract
@@ -16564,6 +16565,7 @@ app.get('/api/admin/users/:id/details', requireMaxAdmin, async (req, res) => {
         is_banned: Number(user.is_banned ?? 0),
         created_at: user.created_at,
         balance: Number(user.balance ?? 0),
+        commissionBalance: Number(user.commissionBalance ?? 0),
         shopBalance: Number(user.shopBalance ?? 0),
         telegramConectado: Number(user.telegramConectado ?? 0),
         telegramConnection,
